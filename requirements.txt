@@ -27,3 +27,7 @@ jsonschema
 omegaconf
 botocore
 boto3
+# New Additions
+ruff
+icecream
+gradio

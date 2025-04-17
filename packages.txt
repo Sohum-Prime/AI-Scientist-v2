@@ -1,0 +1,5 @@
+texlive-latex-base
+texlive-bibtex-extra
+texlive-fonts-recommended
+chktex
+poppler-utils
