@@ -151,8 +151,8 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
 
     # Select the model (can be made a Gradio input later)
     # Using a capable model is important for good ideation
-    ideation_model = "gpt-4o-mini-2024-07-18"  # Cheaper/faster GPT-4o-mini
-    # ideation_model = "gpt-4o-2024-08-06" # Or full GPT-4o
+    ideation_model = "gpt-4o-mini"  # Cheaper/faster GPT-4o-mini
+    # ideation_model = "gpt-4o" # Or full GPT-4o
 
     final_idea = None
     captured_log_output = ""
