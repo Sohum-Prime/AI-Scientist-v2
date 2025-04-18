@@ -8,7 +8,7 @@
 - Added helper functions: `get_timestamp`, `format_log`.
 - Created basic Gradio UI structure using `gr.Blocks` and `gr.Tabs`.
   - Tab 1: Input (Textbox, Dropdown, Button, Status Textbox).
-  - Tab 2: Hypothesis (Log Textbox, Accordion for SemScholar, Final JSON).
+  - Tab 2: Hypothesis (Log Textbox, Accordion for SemScholar, Final JSON). Increased log lines.
   - Tab 3: Experimentation (Stage Markdown, Log Textbox, Accordion for Plots/Gallery, Accordion for Best Node JSON).
   - Tab 4: Reporting (Accordions for Citations/Reflection/Compilation Logs, LaTeX Code, PDF File output).
 - Defined the main orchestration function `run_ai_scientist_pipeline` as a generator.
@@ -18,53 +18,37 @@
 - Added basic API key check on startup.
 - Launched the demo using `demo.launch(debug=True)`.
 
-## Phase 1: Ideation Integration (Simulation)
-- Implemented the start of `run_ai_scientist_pipeline`.
-- Created a `base_run_dir` for this specific run.
-- Added `yield` calls to update the global status and clear/switch to the Hypothesis tab.
-- Added `gr.Progress()` tracking.
-- **Simulated** the ideation process:
-  - Constructed a basic `workshop_desc` from user input.
-  - Yielded status updates to `ideation_log_textbox`.
-  - Simulated Semantic Scholar interaction and yielded updates to `ideation_sem_scholar_textbox`.
-  - Created a `simulated_idea_json` dictionary.
-  - Yielded the final simulated idea to `ideation_final_json`.
-- Stored the simulated idea in `final_idea` for subsequent phases.
-- **TODO:** Replace simulation with actual call to `ai_scientist.perform_ideation_temp_free.generate_temp_free_idea`. This requires adapting `generate_temp_free_idea` to be a generator or capturing its logs/outputs differently.
+## Phase 1: Ideation Integration (Actual Function Call)
+- **Replaced** the simulation block for Phase 1.
+- Imported `StringIO`, `contextlib`, `create_client`, `generate_temp_free_idea`.
+- Added `parse_ideation_logs` helper function to separate general print logs from Semantic Scholar interactions based on patterns in stdout.
+- In `run_ai_scientist_pipeline`:
+  - Created `base_run_dir` using timestamp and part of the user prompt.
+  - Defined `idea_json_path` within `base_run_dir`.
+  - Set `max_generations=1` and `num_reflections=2` for faster demo execution.
+  - Selected `ideation_model` (e.g., "gpt-4o-mini-2024-07-18").
+  - Created the LLM client using `create_client`.
+  - Used `contextlib.redirect_stdout` and `StringIO` to capture print output from `generate_temp_free_idea`.
+  - Called `generate_temp_free_idea` with `reload_ideas=False`.
+  - Parsed the captured stdout using `parse_ideation_logs`.
+  - Yielded the parsed general logs to `ideation_log_textbox` and Semantic Scholar logs to `ideation_sem_scholar_textbox`.
+  - Checked if ideas were generated. If yes, selected the first idea (`final_idea`) and yielded it to `ideation_final_json`.
+  - If no ideas were generated or an exception occurred, yielded error messages and stopped the pipeline. Added specific check for `ImportError` related to `semantic_scholar`.
+- **Note:** Capturing intermediate states beyond stdout parsing would require modifying `generate_temp_free_idea`.
 
-## Phase 2: Experimentation Integration (Simulation)
-- Added `yield` calls to update the global status and clear/switch to the Experimentation tab.
-- **Simulated** the Tree Search process:
-  - Looped through predefined stages (`stages`).
-  - Yielded stage updates to `exp_stage_markdown`.
-  - Looped through simulated nodes within each stage.
-  - Yielded node generation/execution status updates to `exp_log_textbox`.
-  - Simulated node success/failure (buggy nodes).
-  - For successful nodes:
-    - Simulated a metric value.
-    - Created a dummy placeholder plot using PIL and saved it to the run directory.
-    - Appended the plot path to `simulated_plots`.
-    - Simulated VLM feedback.
-    - Yielded updates to `exp_log_textbox` and `exp_plot_gallery`.
-  - Simulated selecting the best node at the end of each stage and yielded to `exp_best_node_json`.
-  - Simulated final plot aggregation, creating a dummy aggregated plot and yielding updates.
-- Stored simulated results (plot paths) in `experiment_results`.
-- **TODO:** Replace simulation with actual call to `ai_scientist.treesearch.perform_experiments_bfts_with_agentmanager.perform_experiments_bfts`. This is the most complex integration, requiring significant adaptation to yield intermediate logs, statuses, and plot paths from the tree search loop. Sandboxing/safety for local execution needs user awareness.
+## Phase 2: Experimentation Integration (Simulation - Unchanged)
+- Kept the simulation logic for Phase 2.
+- Added `try-except` blocks around PIL imports/usage for dummy plot generation to handle cases where PIL might not be installed, preventing crashes.
+- **TODO:** Replace simulation with actual call to `perform_experiments_bfts`.
 
-## Phase 3: Reporting Integration (Simulation)
-- Added `yield` calls to update the global status and clear/switch to the Reporting tab.
-- **Simulated** the Reporting process:
-  - Simulated citation gathering and yielded logs/results to `report_citation_log_textbox`.
-  - Simulated initial LaTeX generation based on the idea/prompt and created a plausible LaTeX string (`sim_latex`).
-  - Yielded the LaTeX code to `report_latex_code`.
-  - Simulated the reflection step (VLM feedback, page limits) and yielded updates to `report_reflection_textbox`.
-  - Simulated LaTeX compilation:
-    - Yielded compilation status to `report_compile_log_textbox`.
-    - Created a dummy text file (`simulated_paper.pdf`) representing the output PDF.
-    - Yielded the path to the dummy PDF to `report_pdf_output`.
-- **TODO:** Replace simulation with actual calls to `gather_citations`, `perform_icbinb_writeup` (or `perform_writeup`), and `compile_latex`. LaTeX compilation requires a local TeX distribution.
+## Phase 3: Reporting Integration (Simulation - Minor Update)
+- Kept the simulation logic for Phase 3.
+- Updated the simulated LaTeX generation to use the actual `final_idea` dictionary (if generated successfully in Phase 1) to populate the title, hypothesis, and abstract, making the simulated output slightly more relevant.
+- Updated `\graphicspath{{./}}` in simulated LaTeX for local compilation context. Changed bib filename to `references.bib`.
+- Used `os.path.basename` for the plot path in LaTeX to avoid issues with absolute paths.
+- **TODO:** Replace simulation with actual calls to `gather_citations`, `perform_icbinb_writeup`, `compile_latex`.
 
 ## Next Steps:
-1.  Integrate the *actual* Ideation phase (`generate_temp_free_idea`). Requires adapting the function or its caller to handle logs/intermediate outputs for Gradio.
-2.  Tackle the *actual* Experimentation phase integration (`perform_experiments_bfts`). This involves modifying the tree search code or its wrapper to yield detailed progress updates, node statuses, error messages, and plot file paths as they are generated.
-3.  Integrate the *actual* Reporting phase (`gather_citations`, `perform_icbinb_writeup`, `compile_latex`). Ensure LaTeX dependencies are met locally.
+1.  **Test** the integrated Ideation phase thoroughly with different prompts and API keys set. Debug any issues with log capture or function calls.
+2.  Begin integration of the **Experimentation phase** (`perform_experiments_bfts`). This will require the most significant work to adapt the existing tree search code to yield incremental updates suitable for Gradio. Decide on the level of detail to yield (every node? stage summaries?). Address local code execution safety (maybe add a confirmation step or run in a restricted environment if possible).
+3.  Integrate the Reporting phase.

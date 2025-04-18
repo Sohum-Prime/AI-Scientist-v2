@@ -8,6 +8,8 @@ import traceback
 from datetime import datetime
 import shutil
 import re
+from io import StringIO
+import contextlib
 
 # --- Add AI Scientist Project Root to Python Path ---
 # Assuming app.py is in the root of your cloned repository
@@ -50,6 +52,63 @@ def format_log(message, level="INFO"):
     return f"{datetime.now().strftime('%H:%M:%S')} [{level}] {message}\n"
 
 
+# --- Function to parse captured stdout for specific logs ---
+def parse_ideation_logs(captured_output):
+    """Separates Semantic Scholar logs from general ideation logs."""
+    general_log = ""
+    sem_scholar_log = ""
+    lines = captured_output.splitlines()
+    is_sem_scholar_result = False
+    current_action = None
+
+    for line in lines:
+        # Look for action lines
+        action_match = re.match(r"Action: (.*)", line)
+        if action_match:
+            current_action = action_match.group(1).strip()
+            is_sem_scholar_result = False  # Reset flag on new action
+
+        # Look for argument lines after a Semantic Scholar action
+        if current_action == "SearchSemanticScholar":
+            args_match = re.match(r"Arguments: (.*)", line)
+            if args_match:
+                sem_scholar_log += f"Query: {args_match.group(1)}\n"
+
+        # Look for the start of results section
+        if "Results from your last action" in line:
+            if current_action == "SearchSemanticScholar":
+                is_sem_scholar_result = True
+                sem_scholar_log += "Results:\n"
+            else:
+                is_sem_scholar_result = (
+                    False  # Stop capturing if it was a different action's results
+                )
+            # Don't add the "Results from..." line itself to either log
+
+        # Capture lines following the results marker if it was Semantic Scholar
+        elif is_sem_scholar_result:
+            sem_scholar_log += line + "\n"
+            # Stop capturing for SemScholar if we hit the next THOUGHT or ACTION
+            if line.strip().startswith("THOUGHT:") or line.strip().startswith(
+                "ACTION:"
+            ):
+                is_sem_scholar_result = False
+                general_log += line + "\n"  # Add this line to general log instead
+            elif not line.strip():  # Stop on empty lines after results
+                is_sem_scholar_result = False
+
+        # Otherwise, add to general log
+        else:
+            # Avoid adding the action/argument lines we already processed for SemScholar
+            if not (
+                current_action == "SearchSemanticScholar"
+                and (re.match(r"Arguments: (.*)", line))
+            ):
+                general_log += line + "\n"
+
+    return general_log.strip(), sem_scholar_log.strip()
+
+
 # --- Main AI Scientist Orchestration Logic ---
 
 
@@ -58,55 +117,144 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
     """
     Main generator function to run the AI Scientist pipeline and yield updates.
     """
-    run_id = f"{get_timestamp()}_gradio_run"
+    run_id = f"{get_timestamp()}_{topic_prompt[:20].replace(' ','_')}"  # Include part of prompt in run ID
     base_run_dir = os.path.join(project_root, "gradio_runs", run_id)
     os.makedirs(base_run_dir, exist_ok=True)
+    print(f"Starting Run: {run_id}, Directory: {base_run_dir}")
 
     # --- Phase 1: Ideation ---
     yield {
         global_status_textbox: gr.update(
             value=format_log("Starting Phase 1: Hypothesis Generation...")
         ),
-        # Clear previous phase outputs
         ideation_final_json: gr.update(value=None),
         ideation_log_textbox: gr.update(value=""),
         ideation_sem_scholar_textbox: gr.update(value=""),
-        # Switch to the Hypothesis tab
-        tabs: gr.update(selected=1),
+        tabs: gr.update(selected=1),  # Switch to Hypothesis tab
     }
     progress(0.1, desc="Generating Hypothesis")
 
     # Prepare for ideation
-    # For simplicity, we'll use a fixed workshop description or derive one
-    # In a real app, this could be dynamic or selected by the user
-    workshop_desc = f"Investigate novel ideas related to: {topic_prompt}"
+    workshop_desc = (
+        f"## Research Topic\nInvestigate novel ideas related to: {topic_prompt}"
+    )
     if topic_area != "Default":
-        workshop_desc += f" Focus on {topic_area}."
+        workshop_desc += f"\nFocus specifically on areas relevant to {topic_area}."
 
-    ideation_log = format_log("Starting Ideation...")
-    yield {ideation_log_textbox: ideation_log}
+    # Define path for saving generated ideas
+    idea_json_path = os.path.join(base_run_dir, "generated_ideas.json")
 
-    # TODO: Integrate actual ideation call
-    # For now, simulate finding an idea
-    time.sleep(2)  # Simulate work
-    simulated_idea_json = {
-        "Name": "simulated_idea",
-        "Title": f"Simulated Study on {topic_prompt}",
-        "Short Hypothesis": "A simulated hypothesis based on the user prompt.",
-        "Related Work": "Simulated related work section.",
-        "Abstract": "Simulated abstract.",
-        "Experiments": ["Simulated experiment 1", "Simulated experiment 2"],
-        "Risk Factors and Limitations": ["Simulated risks."],
-    }
-    ideation_log += format_log("Simulated Semantic Scholar Search...")
-    yield {
-        ideation_log_textbox: ideation_log,
-        ideation_sem_scholar_textbox: "Query: effect of learning rate\nResult: Found 3 relevant papers (Simulated)",
-    }
-    time.sleep(1)
-    ideation_log += format_log("Generated final idea.")
-    yield {ideation_log_textbox: ideation_log, ideation_final_json: simulated_idea_json}
-    final_idea = simulated_idea_json  # Use this in next phases
+    # Configure ideation parameters (can be made Gradio inputs later)
+    # Reduce generations/reflections for faster demo turnaround
+    max_generations = 1  # Generate only 1 idea for the demo
+    num_reflections = 2  # Use fewer reflections
+
+    # Select the model (can be made a Gradio input later)
+    # Using a capable model is important for good ideation
+    ideation_model = "gpt-4o-mini-2024-07-18"  # Cheaper/faster GPT-4o-mini
+    # ideation_model = "gpt-4o-2024-08-06" # Or full GPT-4o
+
+    final_idea = None
+    captured_log_output = ""
+    general_ideation_log = ""
+    sem_scholar_log_output = ""
+
+    try:
+        print(f"Creating LLM client for model: {ideation_model}")
+        client, client_model_name = create_client(
+            ideation_model
+        )  # client_model_name might differ slightly
+        print(f"Using model: {client_model_name}")
+
+        # Capture stdout from the ideation function
+        log_stream = StringIO()
+        with contextlib.redirect_stdout(log_stream):
+            print(f"--- Starting AI Scientist Ideation ({client_model_name}) ---")
+            # Call the actual ideation function
+            # reload_ideas=False ensures we generate fresh for each demo run
+            generated_ideas = generate_temp_free_idea(
+                idea_fname=idea_json_path,
+                client=client,
+                model=client_model_name,
+                workshop_description=workshop_desc,
+                max_num_generations=max_generations,
+                num_reflections=num_reflections,
+                reload_ideas=False,  # Start fresh each time for demo
+            )
+            print("--- Finished AI Scientist Ideation ---")
+
+        captured_log_output = log_stream.getvalue()
+        print("\n--- Captured Ideation Logs ---")
+        print(captured_log_output)
+        print("--- End Captured Ideation Logs ---\n")
+
+        # Parse logs for different Gradio components
+        general_ideation_log, sem_scholar_log_output = parse_ideation_logs(
+            captured_log_output
+        )
+
+        # Update Gradio logs immediately
+        yield {
+            ideation_log_textbox: general_ideation_log,
+            ideation_sem_scholar_textbox: (
+                sem_scholar_log_output
+                if sem_scholar_log_output
+                else "No Semantic Scholar interactions logged."
+            ),
+        }
+
+        if generated_ideas:
+            final_idea = generated_ideas[0]  # Take the first generated idea
+            yield {ideation_final_json: final_idea}
+            yield {
+                global_status_textbox: gr.update(
+                    value=format_log("Phase 1: Hypothesis Generation COMPLETE.")
+                )
+            }
+            print(f"Successfully generated idea: {final_idea.get('Name', 'Unnamed')}")
+        else:
+            error_msg = format_log(
+                "Phase 1: Hypothesis Generation FAILED. No ideas were generated.",
+                level="ERROR",
+            )
+            yield {
+                global_status_textbox: gr.update(value=error_msg),
+                ideation_log_textbox: gr.update(
+                    value=general_ideation_log + "\n" + error_msg
+                ),
+            }
+            print("Ideation failed to produce an idea.")
+            return  # Stop the pipeline if ideation fails
+
+    except ImportError as e:
+        # Specific handling for missing packages like 'semantic_scholar'
+        error_msg = format_log(
+            f"Phase 1: Import Error - {e}. Please ensure all dependencies (like 'semantic_scholar') are installed.",
+            level="ERROR",
+        )
+        yield {
+            global_status_textbox: gr.update(value=error_msg),
+            ideation_log_textbox: error_msg,
+        }
+        traceback.print_exc()
+        return
+    except Exception as e:
+        error_msg = format_log(
+            f"Phase 1: Hypothesis Generation FAILED. Error: {e}", level="ERROR"
+        )
+        # Append traceback to the general log for debugging
+        tb_str = traceback.format_exc()
+        full_log_msg = (
+            general_ideation_log + "\n" + error_msg + "\nTraceback:\n" + tb_str
+        )
+        yield {
+            global_status_textbox: gr.update(value=error_msg),
+            ideation_log_textbox: gr.update(value=full_log_msg),
+            ideation_sem_scholar_textbox: sem_scholar_log_output,  # Show whatever SemScholar log we got
+        }
+        print(f"Exception during ideation: {e}")
+        traceback.print_exc()
+        return  # Stop the pipeline if ideation fails
 
     # --- Phase 2: Experimentation ---
     yield {
@@ -467,18 +615,25 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
 if __name__ == "__main__":
     # Load API keys from environment variables
-    # Ensure OPENAI_API_KEY, etc. are set before running
     print("Checking for API keys...")
-    required_keys = [
-        "OPENAI_API_KEY"
-    ]  # Add others as needed (e.g., AWS keys for Bedrock)
+    # Add any other keys your chosen ideation model might need (e.g., Anthropic, Bedrock)
+    required_keys = ["OPENAI_API_KEY"]
+    # Optional key for literature search
+    optional_keys = ["S2_API_KEY"]
+
     missing_keys = [key for key in required_keys if key not in os.environ]
     if missing_keys:
         print(
-            f"\n!!! WARNING: Missing environment variables: {', '.join(missing_keys)} !!!"
+            f"\n!!! WARNING: Missing required environment variables: {', '.join(missing_keys)} !!!"
         )
-        print("Please set them before running the application.")
-        # sys.exit(1) # Optionally exit if keys are strictly required
+        print("Ideation might fail. Please set them before running the application.")
+        # sys.exit(1) # Exit if keys are essential
+
+    missing_optional = [key for key in optional_keys if key not in os.environ]
+    if missing_optional:
+        print(
+            f"\nINFO: Missing optional environment variables: {', '.join(missing_optional)}. Semantic Scholar search might be limited."
+        )
 
     print("Launching Gradio Demo...")
     # Share=True creates a public link, requires login tunnel if run locally without easy public IP.
