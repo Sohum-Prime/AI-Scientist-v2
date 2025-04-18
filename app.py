@@ -483,4 +483,4 @@ if __name__ == "__main__":
     print("Launching Gradio Demo...")
     # Share=True creates a public link, requires login tunnel if run locally without easy public IP.
     # Set debug=True for more detailed Gradio errors during development.
-    demo.launch(debug=True, share=False)  # Set share=True to try ngrok tunneling
+    demo.launch(debug=True, share=True)  # Set share=True to try ngrok tunneling
