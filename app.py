@@ -468,12 +468,12 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
     base_config_path = os.path.join(project_root, "bfts_config.yaml")
     run_config_path = os.path.join(base_run_dir, "bfts_config.yaml")
     final_idea_path = os.path.join(
-        base_run_dir, "idea.json"
+        base_run_dir, "generated_ideas.json"
     )  # Path where we saved the idea
 
     if not os.path.exists(final_idea_path):
         error_msg = format_log(
-            "Experimentation FAILED: idea.json not found.", level="ERROR"
+            "Experimentation FAILED: generated_ideas.json not found.", level="ERROR"
         )
         yield {
             global_status_textbox: gr.update(value=error_msg),
