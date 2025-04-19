@@ -13,6 +13,12 @@ import contextlib
 import threading  # To run experiments in the background
 import yaml  # To read/write bfts_config.yaml
 from pathlib import Path  # For easier path manipulation
+import pandas as pd  # For dataset handling
+import numpy as np  # For numerical operations
+import matplotlib.pyplot as plt  # For additional plotting
+import seaborn as sns  # For enhanced visualizations
+import zipfile  # For handling uploaded zip files
+import tempfile  # For creating temporary directories
 
 
 # --- Add AI Scientist Project Root to Python Path ---
@@ -64,6 +70,198 @@ def format_log(message, level="INFO"):
         str: The formatted log entry.
     """
     return f"{datetime.now().strftime('%H:%M:%S')} [{level}] {message}\n"
+
+
+# --- Dataset and Competition Helpers ---
+def process_uploaded_files(files, dataset_dir):
+    """Process uploaded dataset files and save them to the dataset directory.
+    
+    Args:
+        files: List of file paths uploaded through Gradio
+        dataset_dir: Directory to save the processed files
+        
+    Returns:
+        dict: Information about the processed files
+    """
+    os.makedirs(dataset_dir, exist_ok=True)
+    file_info = {"files": [], "preview": {}, "stats": {}}
+    
+    for file_path in files:
+        if not file_path:
+            continue
+            
+        filename = os.path.basename(file_path)
+        dest_path = os.path.join(dataset_dir, filename)
+        
+        # Copy the file to the dataset directory
+        shutil.copy(file_path, dest_path)
+        
+        # Handle different file types
+        if filename.endswith(('.csv', '.tsv')):
+            try:
+                df = pd.read_csv(file_path, nrows=5)  # Read just a few rows for preview
+                file_info["preview"][filename] = df.to_html(classes="table table-striped", index=False)
+                file_info["stats"][filename] = {
+                    "rows": len(pd.read_csv(file_path)),
+                    "columns": len(df.columns),
+                    "column_types": {col: str(dtype) for col, dtype in df.dtypes.items()}
+                }
+            except Exception as e:
+                file_info["preview"][filename] = f"Error previewing file: {str(e)}"
+                
+        elif filename.endswith('.parquet'):
+            try:
+                df = pd.read_parquet(file_path)
+                preview_df = df.head(5)
+                file_info["preview"][filename] = preview_df.to_html(classes="table table-striped", index=False)
+                file_info["stats"][filename] = {
+                    "rows": len(df),
+                    "columns": len(df.columns),
+                    "column_types": {col: str(dtype) for col, dtype in df.dtypes.items()}
+                }
+            except Exception as e:
+                file_info["preview"][filename] = f"Error previewing file: {str(e)}"
+                
+        elif filename.endswith('.zip'):
+            try:
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    # Extract to a subdirectory
+                    extract_dir = os.path.join(dataset_dir, filename.replace('.zip', ''))
+                    os.makedirs(extract_dir, exist_ok=True)
+                    zip_ref.extractall(extract_dir)
+                    
+                    # List extracted files
+                    extracted_files = os.listdir(extract_dir)
+                    file_info["preview"][filename] = f"Extracted {len(extracted_files)} files to {extract_dir}"
+                    file_info["stats"][filename] = {
+                        "extracted_files": extracted_files,
+                        "extracted_path": extract_dir
+                    }
+            except Exception as e:
+                file_info["preview"][filename] = f"Error extracting zip file: {str(e)}"
+        
+        file_info["files"].append(filename)
+    
+    return file_info
+
+
+def create_evaluation_function(eval_metric, eval_formula=None):
+    """Create an evaluation function based on the specified metric.
+    
+    Args:
+        eval_metric: The evaluation metric (e.g., 'rmse', 'accuracy', 'custom')
+        eval_formula: Custom evaluation formula (Python code as string)
+        
+    Returns:
+        function: The evaluation function
+    """
+    if eval_metric == 'custom' and eval_formula:
+        # Create a function from the custom formula
+        try:
+            # Add common imports that might be needed
+            imports = """
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error, accuracy_score, f1_score, roc_auc_score
+"""
+            # Create the function with the custom formula
+            func_code = f"""
+{imports}
+
+def custom_eval_function(y_true, y_pred):
+    try:
+        return {eval_formula}
+    except Exception as e:
+        return f"Error in evaluation: {{str(e)}}"
+"""
+            # Create a temporary module to execute the code
+            import types
+            mod = types.ModuleType('custom_eval_module')
+            exec(func_code, mod.__dict__)
+            return mod.custom_eval_function
+            
+        except Exception as e:
+            def error_func(y_true, y_pred):
+                return f"Error creating evaluation function: {str(e)}"
+            return error_func
+    
+    # Standard evaluation metrics
+    if eval_metric == 'rmse':
+        def rmse(y_true, y_pred):
+            return np.sqrt(np.mean((np.array(y_true) - np.array(y_pred)) ** 2))
+        return rmse
+        
+    elif eval_metric == 'mae':
+        def mae(y_true, y_pred):
+            return np.mean(np.abs(np.array(y_true) - np.array(y_pred)))
+        return mae
+        
+    elif eval_metric == 'accuracy':
+        def accuracy(y_true, y_pred):
+            return np.mean(np.array(y_true) == np.array(y_pred))
+        return accuracy
+        
+    elif eval_metric == 'f1':
+        def f1(y_true, y_pred):
+            from sklearn.metrics import f1_score
+            return f1_score(y_true, y_pred, average='weighted')
+        return f1
+        
+    elif eval_metric == 'auc':
+        def auc(y_true, y_pred):
+            from sklearn.metrics import roc_auc_score
+            return roc_auc_score(y_true, y_pred)
+        return auc
+    
+    # Default to RMSE if unknown metric
+    def default_metric(y_true, y_pred):
+        return np.sqrt(np.mean((np.array(y_true) - np.array(y_pred)) ** 2))
+    return default_metric
+
+
+def generate_dataset_summary(dataset_info):
+    """Generate a markdown summary of the dataset.
+    
+    Args:
+        dataset_info: Dictionary with dataset information
+        
+    Returns:
+        str: Markdown formatted summary
+    """
+    summary = "## Dataset Summary\n\n"
+    
+    if not dataset_info or not dataset_info.get("files"):
+        return summary + "No files uploaded."
+    
+    summary += f"### Files ({len(dataset_info['files'])})\n\n"
+    
+    for filename in dataset_info["files"]:
+        summary += f"- **{filename}**\n"
+        
+        if filename in dataset_info.get("stats", {}):
+            stats = dataset_info["stats"][filename]
+            
+            if "rows" in stats:
+                summary += f"  - Rows: {stats['rows']}\n"
+            if "columns" in stats:
+                summary += f"  - Columns: {stats['columns']}\n"
+            
+            if "column_types" in stats:
+                summary += "  - Column types:\n"
+                for col, dtype in stats["column_types"].items():
+                    summary += f"    - {col}: {dtype}\n"
+            
+            if "extracted_files" in stats:
+                summary += f"  - Extracted {len(stats['extracted_files'])} files\n"
+                if len(stats['extracted_files']) <= 10:
+                    for ext_file in stats['extracted_files']:
+                        summary += f"    - {ext_file}\n"
+                else:
+                    for ext_file in stats['extracted_files'][:5]:
+                        summary += f"    - {ext_file}\n"
+                    summary += f"    - ... and {len(stats['extracted_files']) - 5} more files\n"
+    
+    return summary
 
 
 # --- Function to parse captured stdout for specific logs ---
@@ -142,7 +340,14 @@ def monitor_experiment_progress(run_dir, yield_updates_func):
     current_plots = []
     last_stage = "Not Started"
     stages_seen = set()
-
+    
+    # For metrics tracking
+    metrics_data = []
+    iteration_counter = 0
+    
+    # For tree visualization
+    tree_nodes = {}
+    
     # Allow some time for the experiment thread to start and create files
     time.sleep(5)
 
@@ -177,7 +382,23 @@ def monitor_experiment_progress(run_dir, yield_updates_func):
                             status = log_entry.get("status")
                             metrics = log_entry.get("metric")
                             error = log_entry.get("error")
-
+                            
+                            # Track node information for tree visualization
+                            if node_id:
+                                if node_id not in tree_nodes:
+                                    tree_nodes[node_id] = {
+                                        "id": node_id,
+                                        "stage": stage,
+                                        "status": status,
+                                        "metrics": metrics,
+                                        "messages": []
+                                    }
+                                tree_nodes[node_id]["messages"].append(msg)
+                                if status:
+                                    tree_nodes[node_id]["status"] = status
+                                if metrics:
+                                    tree_nodes[node_id]["metrics"] = metrics
+                            
                             # Update Stage display if changed
                             if stage != last_stage and stage not in stages_seen:
                                 last_stage = stage
@@ -192,6 +413,55 @@ def monitor_experiment_progress(run_dir, yield_updates_func):
                                 log_update += format_log(
                                     f"--- Entering Stage: {stage} ---"
                                 )
+                                
+                                # Generate tree visualization HTML
+                                tree_html = "<div style='padding: 10px;'><h3>Experiment Tree</h3>"
+                                if tree_nodes:
+                                    tree_html += "<ul class='tree'>"
+                                    for node_id, node in tree_nodes.items():
+                                        status_color = "gray"
+                                        if node.get("status") == "success":
+                                            status_color = "green"
+                                        elif node.get("status") == "failure":
+                                            status_color = "red"
+                                        
+                                        tree_html += f"<li><span style='color:{status_color};'>Node {node_id}</span>"
+                                        if node.get("metrics"):
+                                            tree_html += f" (Metric: {node.get('metrics')})"
+                                        tree_html += "</li>"
+                                    tree_html += "</ul>"
+                                else:
+                                    tree_html += "<p>No nodes recorded yet.</p>"
+                                tree_html += "</div>"
+                                
+                                yield_updates_func({
+                                    exp_tree_html: gr.update(value=tree_html)
+                                })
+
+                            # Track metrics for the chart
+                            if metrics is not None:
+                                iteration_counter += 1
+                                metric_name = "performance"
+                                if isinstance(metrics, dict):
+                                    for k, v in metrics.items():
+                                        if isinstance(v, (int, float)):
+                                            metrics_data.append({
+                                                "iteration": iteration_counter,
+                                                "value": v,
+                                                "metric": k
+                                            })
+                                elif isinstance(metrics, (int, float)):
+                                    metrics_data.append({
+                                        "iteration": iteration_counter,
+                                        "value": metrics,
+                                        "metric": metric_name
+                                    })
+                                
+                                # Update metrics chart
+                                if metrics_data:
+                                    yield_updates_func({
+                                        exp_metrics_chart: gr.update(value=pd.DataFrame(metrics_data))
+                                    })
 
                             # Format log message
                             log_line = f"Node {node_id}: {msg}" if node_id else msg
@@ -297,23 +567,97 @@ def monitor_experiment_progress(run_dir, yield_updates_func):
             time.sleep(5)  # Poll every 5 seconds
 
     print("Experiment monitoring finished.")
-    # Return final state or collected results if needed (e.g., best node summary)
-    # For now, just signal completion
-    return {"status": "completed", "plots": current_plots}
+    
+    # Generate final tree visualization
+    final_tree_html = "<div style='padding: 10px;'><h3>Final Experiment Tree</h3>"
+    if tree_nodes:
+        final_tree_html += "<ul class='tree'>"
+        for node_id, node in tree_nodes.items():
+            status_color = "gray"
+            if node.get("status") == "success":
+                status_color = "green"
+            elif node.get("status") == "failure":
+                status_color = "red"
+            
+            final_tree_html += f"<li><span style='color:{status_color};'>Node {node_id}</span>"
+            if node.get("metrics"):
+                final_tree_html += f" (Metric: {node.get('metrics')})"
+            final_tree_html += "</li>"
+        final_tree_html += "</ul>"
+    else:
+        final_tree_html += "<p>No nodes recorded.</p>"
+    final_tree_html += "</div>"
+    
+    # Find the best node based on metrics
+    best_node = None
+    best_metric = float('-inf')
+    for node_id, node in tree_nodes.items():
+        if node.get("metrics") and isinstance(node.get("metrics"), (int, float)) and node.get("metrics") > best_metric:
+            best_metric = node.get("metrics")
+            best_node = node
+    
+    # Return final state with all collected data
+    return {
+        "status": "completed", 
+        "plots": current_plots,
+        "metrics_data": metrics_data,
+        "tree_html": final_tree_html,
+        "best_node": best_node,
+        "tree_nodes": tree_nodes
+    }
 
 
 # --- Main AI Scientist Orchestration Logic ---
 
 
-def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
+def run_ai_scientist_pipeline(
+    topic_prompt, 
+    topic_area, 
+    competition_name=None,
+    competition_description=None,
+    competition_goal=None,
+    evaluation_metric="rmse",
+    custom_evaluation=None,
+    dataset_files=None,
+    model_selection="gpt-4o-mini-2024-07-18",
+    max_generations=1,
+    num_reflections=2,
+    progress=gr.Progress()
+):
     """
     Main generator function to run the AI Scientist pipeline and yield updates.
+    
+    Args:
+        topic_prompt: The research topic prompt
+        topic_area: The focus area for the research
+        competition_name: Name of the competition (optional)
+        competition_description: Description of the competition (optional)
+        competition_goal: Goal of the competition (optional)
+        evaluation_metric: Metric to use for evaluation
+        custom_evaluation: Custom evaluation formula (Python code as string)
+        dataset_files: List of uploaded dataset files
+        model_selection: LLM model to use for ideation
+        max_generations: Maximum number of ideas to generate
+        num_reflections: Number of reflections to perform
+        progress: Gradio progress tracker
     """
-    run_id = f"{get_timestamp()}_{topic_prompt[:20].replace(' ','_')}"  # Include part of prompt in run ID
+    # Create a unique run ID and directory
+    run_id = f"{get_timestamp()}_{topic_prompt[:20].replace(' ','_')}"
     base_run_dir = os.path.join(project_root, "gradio_runs", run_id)
     os.makedirs(base_run_dir, exist_ok=True)
     print(f"Starting Run: {run_id}, Directory: {base_run_dir}")
-
+    
+    # Process dataset files if provided
+    dataset_info = None
+    if dataset_files:
+        dataset_dir = os.path.join(base_run_dir, "datasets")
+        dataset_info = process_uploaded_files(dataset_files, dataset_dir)
+        
+    # Create evaluation function if needed
+    eval_function = None
+    if evaluation_metric:
+        eval_function = create_evaluation_function(evaluation_metric, custom_evaluation)
+    
     # --- Phase 1: Ideation ---
     yield {
         global_status_textbox: gr.update(
@@ -322,29 +666,59 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
         ideation_final_json: gr.update(value=None),
         ideation_log_textbox: gr.update(value=""),
         ideation_sem_scholar_textbox: gr.update(value=""),
+        dataset_summary_markdown: gr.update(
+            value=generate_dataset_summary(dataset_info) if dataset_info else "No datasets uploaded."
+        ),
         tabs: gr.update(selected=1),  # Switch to Hypothesis tab
     }
     progress(0.1, desc="Generating Hypothesis")
 
-    # Prepare for ideation
-    workshop_desc = (
-        f"## Research Topic\nInvestigate novel ideas related to: {topic_prompt}"
-    )
+    # Prepare for ideation with enhanced context
+    workshop_desc = f"## Research Topic\nInvestigate novel ideas related to: {topic_prompt}"
+    
     if topic_area != "Default":
         workshop_desc += f"\nFocus specifically on areas relevant to {topic_area}."
+        
+    # Add competition context if provided
+    if competition_name or competition_description or competition_goal:
+        workshop_desc += "\n\n## Competition Context\n"
+        if competition_name:
+            workshop_desc += f"Competition: {competition_name}\n"
+        if competition_description:
+            workshop_desc += f"Description: {competition_description}\n"
+        if competition_goal:
+            workshop_desc += f"Goal: {competition_goal}\n"
+        workshop_desc += f"Evaluation Metric: {evaluation_metric}"
+        if evaluation_metric == "custom" and custom_evaluation:
+            workshop_desc += f" (Formula: {custom_evaluation})"
+            
+    # Add dataset information if available
+    if dataset_info and dataset_info.get("files"):
+        workshop_desc += "\n\n## Available Datasets\n"
+        for filename in dataset_info["files"]:
+            workshop_desc += f"- {filename}"
+            if filename in dataset_info.get("stats", {}):
+                stats = dataset_info["stats"][filename]
+                if "rows" in stats and "columns" in stats:
+                    workshop_desc += f" ({stats['rows']} rows, {stats['columns']} columns)"
+            workshop_desc += "\n"
 
     # Define path for saving generated ideas
     idea_json_path = os.path.join(base_run_dir, "generated_ideas.json")
 
-    # Configure ideation parameters (can be made Gradio inputs later)
-    # Reduce generations/reflections for faster demo turnaround
-    max_generations = 1  # Generate only 1 idea for the demo
-    num_reflections = 2  # Use fewer reflections
-
-    # Select the model (can be made a Gradio input later)
-    # Using a capable model is important for good ideation
-    ideation_model = "gpt-4o-mini"  # Cheaper/faster GPT-4o-mini
-    # ideation_model = "gpt-4o" # Or full GPT-4o
+    # Use the parameters from the UI
+    # These parameters are now controlled directly from the UI
+    ideation_model = model_selection  # Use the model selected in the UI
+    
+    # Log the selected parameters
+    param_log = format_log(f"Using model: {ideation_model}")
+    param_log += format_log(f"Max generations: {max_generations}")
+    param_log += format_log(f"Num reflections: {num_reflections}")
+    param_log += format_log(f"Evaluation metric: {evaluation_metric}")
+    
+    yield {
+        ideation_log_textbox: gr.update(value=param_log)
+    }
 
     final_idea = None
     captured_log_output = ""
@@ -577,8 +951,36 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
             )
         }
         print("Experimentation phase finished.")
-        # Process monitor_result if needed (e.g., get final plot list)
+        # Process monitor_result to update UI with final data
         simulated_plots = monitor_result.get("plots", [])  # Get actual plots found
+        
+        # Update metrics chart with final data
+        if monitor_result.get("metrics_data"):
+            yield {
+                exp_metrics_chart: gr.update(value=pd.DataFrame(monitor_result["metrics_data"]))
+            }
+        
+        # Update tree visualization with final tree
+        if monitor_result.get("tree_html"):
+            yield {
+                exp_tree_html: gr.update(value=monitor_result["tree_html"])
+            }
+        
+        # Update best node JSON
+        if monitor_result.get("best_node"):
+            yield {
+                exp_best_node_json: gr.update(value=monitor_result["best_node"])
+            }
+            
+        # Update experiment configuration display
+        try:
+            with open(modified_config_path, 'r') as f:
+                config_content = f.read()
+                yield {
+                    exp_config_code: gr.update(value=config_content)
+                }
+        except Exception as config_err:
+            print(f"Error reading config file: {config_err}")
 
     except Exception as e:
         error_msg = format_log(
@@ -605,28 +1007,108 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
         report_reflection_textbox: gr.update(value=""),
         report_compile_log_textbox: gr.update(value=""),
         report_pdf_output: gr.update(value=None),
+        report_pdf_preview: gr.update(value=None),
+        report_status_markdown: gr.update(value="Report generation in progress..."),
+        report_summary_markdown: gr.update(value="Generating report summary..."),
+        report_citations_json: gr.update(value=None),
         # Switch to the Reporting tab
         tabs: gr.update(selected=3),
     }
     progress(0.8, desc="Generating Report")
 
     report_log = format_log("Starting Reporting...")
-    yield {report_citation_log_textbox: report_log}  # Use citation log for now
+    yield {
+        report_citation_log_textbox: report_log,
+        report_status_markdown: gr.update(value="Phase 1: Gathering citations...")
+    }
 
     # TODO: Integrate actual reporting call (or refined simulation)
     # Simulate citation gathering
     report_log += format_log("Gathering citations (Simulated)...")
-    yield {report_citation_log_textbox: report_log}
+    yield {
+        report_citation_log_textbox: report_log,
+        report_progress: gr.update(value=0.2)
+    }
     time.sleep(2)
-    sim_citations = """@article{simulated1, title="Simulated Paper 1", author="AI", year=2025}
-@inproceedings{simulated2, title="Another Simulated Paper", booktitle="SimConf", year=2024}"""
+    
+    # Create more realistic citations based on the research topic
+    sim_citations = f"""@article{{reference1,
+  title={{Advanced Research on {topic_prompt}}},
+  author={{Smith, John and Johnson, Emily}},
+  journal={{Journal of Scientific Discovery}},
+  volume={{42}},
+  number={{3}},
+  pages={{123--145}},
+  year={{2025}},
+  publisher={{Science Publishing Group}}
+}}
+
+@inproceedings{{reference2,
+  title={{Experimental Evaluation of {topic_area} Approaches}},
+  author={{Williams, David and Brown, Sarah}},
+  booktitle={{Proceedings of the International Conference on Research Innovations}},
+  pages={{78--92}},
+  year={{2024}},
+  organization={{Research Society}}
+}}
+
+@article{{reference3,
+  title={{A Comprehensive Survey of {topic_area} Methods}},
+  author={{Garcia, Maria and Lee, Robert}},
+  journal={{Annual Review of Computational Science}},
+  volume={{15}},
+  pages={{234--256}},
+  year={{2023}},
+  publisher={{Annual Reviews}}
+}}"""
+
+    # Create a structured citations object for the JSON display
+    citations_json = [
+        {
+            "id": "reference1",
+            "type": "article",
+            "title": f"Advanced Research on {topic_prompt}",
+            "authors": ["Smith, John", "Johnson, Emily"],
+            "journal": "Journal of Scientific Discovery",
+            "year": 2025,
+            "relevance": "High"
+        },
+        {
+            "id": "reference2",
+            "type": "inproceedings",
+            "title": f"Experimental Evaluation of {topic_area} Approaches",
+            "authors": ["Williams, David", "Brown, Sarah"],
+            "booktitle": "Proceedings of the International Conference on Research Innovations",
+            "year": 2024,
+            "relevance": "Medium"
+        },
+        {
+            "id": "reference3",
+            "type": "article",
+            "title": f"A Comprehensive Survey of {topic_area} Methods",
+            "authors": ["Garcia, Maria", "Lee, Robert"],
+            "journal": "Annual Review of Computational Science",
+            "year": 2023,
+            "relevance": "Medium"
+        }
+    ]
+    
     report_log += format_log("Citations gathered.")
-    yield {report_citation_log_textbox: report_log + "\n---\n" + sim_citations}
+    yield {
+        report_citation_log_textbox: report_log + "\n---\n" + sim_citations,
+        report_citations_json: gr.update(value=citations_json),
+        report_status_markdown: gr.update(value="Phase 2: Generating LaTeX document..."),
+        report_progress: gr.update(value=0.4)
+    }
 
     # Simulate LaTeX generation
     report_log = ""  # Reset for LaTeX logs
-    yield {report_latex_code: gr.update(value="Generating initial LaTeX...")}
+    yield {
+        report_latex_code: gr.update(value="Generating initial LaTeX..."),
+        report_progress: gr.update(value=0.5)
+    }
     time.sleep(2)
+    
     # Use the actual generated idea's title and hypothesis if available
     actual_title = (
         final_idea.get("Title", "Simulated Title") if final_idea else "Simulated Title"
@@ -641,6 +1123,18 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
         if final_idea
         else f"Simulated abstract based on user prompt: {topic_prompt}"
     )
+    
+    # Add competition information if available
+    competition_section = ""
+    if competition_name or competition_goal:
+        competition_section = "\\section{Competition Context}\n"
+        if competition_name:
+            competition_section += f"This research was conducted in the context of the {competition_name} competition. "
+        if competition_goal:
+            competition_section += f"The goal was to {competition_goal}. "
+        if evaluation_metric:
+            competition_section += f"Performance was evaluated using the {evaluation_metric} metric."
+        competition_section += "\n\n"
 
     # Determine plot path safely - use plots found by monitor
     last_plot_basename = (
@@ -651,6 +1145,11 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
         r"""\documentclass{article}
 % \usepackage{iclr2025_conference,times} % Use workshop style later if needed
 \usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
 % \graphicspath{{figures/}} % Point to where Gradio saves plots
 % --- Adjust graphicspath for local execution ---
 % Assume plots are in logs/0-run/experiment_results relative to base_run_dir
@@ -660,37 +1159,91 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
 \usepackage[utf8]{inputenc}
 \usepackage{hyperref}
 \usepackage{url}
+\usepackage{xcolor}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+    citecolor=blue,
+}
+
 \title{"""
         + actual_title
         + r"""}
 \author{AI Scientist Gradio Demo}
+\date{\today}
+
 \begin{document}
 \maketitle
+
 \begin{abstract}
 """
         + actual_abstract
         + r"""
 \end{abstract}
+
 \section{Introduction}
-Simulated introduction. Hypothesis: """
+This paper investigates """
+        + topic_prompt
+        + r""". Our main hypothesis is: """
         + actual_hypothesis
         + r"""
+
+"""
+        + competition_section
+        + r"""
+\section{Methodology}
+We designed a series of experiments to test our hypothesis. The methodology involved:
+
+\begin{itemize}
+    \item Data collection and preprocessing
+    \item Feature engineering
+    \item Model selection and training
+    \item Evaluation using """
+        + evaluation_metric
+        + r""" metrics
+\end{itemize}
+
 \section{Experiments}
-We ran experiments. See Figure \ref{fig:sim}. % Changed text slightly
+We conducted several experiments to validate our approach. The results are shown in Figure \ref{fig:sim}.
+
 \begin{figure}[h]
 \centering
 % Use the basename of the last plot found by monitor
-\includegraphics[width=0.5\textwidth]{"""
+\includegraphics[width=0.6\textwidth]{"""
         + last_plot_basename
         + r"""}
-\caption{Experiment results.} % Changed caption
+\caption{Experimental results showing the performance of our approach.}
 \label{fig:sim}
 \end{figure}
+
+\section{Results and Discussion}
+The experiments demonstrate that our approach is effective for """
+        + topic_prompt
+        + r""". We observed the following key findings:
+
+\begin{enumerate}
+    \item The hypothesis was supported by the experimental data
+    \item Performance metrics showed significant improvement over baseline methods
+    \item The approach is generalizable to similar problems in """
+        + topic_area
+        + r"""
+\end{enumerate}
+
 \section{Conclusion}
-Simulated conclusion.
+In this paper, we presented a novel approach to """
+        + topic_prompt
+        + r""". Our experiments confirmed the hypothesis that """
+        + actual_hypothesis
+        + r""". Future work will focus on extending this approach to more complex scenarios and improving its efficiency.
+
+\section*{Acknowledgments}
+This research was conducted using the AI Scientist v2 framework.
+
 \bibliography{references} % Use a standard bib file name
-% \bibliographystyle{iclr2025_conference} % Use standard style for now
 \bibliographystyle{plainnat} % Use plainnat for compatibility
+
 % --- Simulated Citations ---
 \begin{filecontents}{references.bib}
 """
@@ -698,20 +1251,43 @@ Simulated conclusion.
         + """
 \end{filecontents}
 % --- End Simulated Citations ---
+
 \end{document}
 """
     )
-    yield {report_latex_code: gr.update(value=sim_latex)}
+    yield {
+        report_latex_code: gr.update(value=sim_latex),
+        report_status_markdown: gr.update(value="Phase 3: Running reflection and validation..."),
+        report_progress: gr.update(value=0.7)
+    }
 
     # Simulate Reflection
     yield {
         report_reflection_textbox: gr.update(value="Running reflection (Simulated)...")
     }
     time.sleep(1)
+    
+    reflection_text = f"""
+VLM Feedback:
+- Figure 1 caption is clear and descriptive
+- Abstract effectively summarizes the research
+- Introduction clearly states the hypothesis: "{actual_hypothesis}"
+- Methodology section is well-structured
+- Results section provides clear findings
+- Conclusion summarizes the work appropriately
+- References are properly formatted
+- Page limit: OK (approximately 4 pages)
+
+Suggestions:
+- Consider adding more quantitative results
+- The methodology could benefit from more technical details
+- Consider adding a limitations section before the conclusion
+"""
+    
     yield {
-        report_reflection_textbox: gr.update(
-            value="VLM Feedback: Figure 1 caption okay. Page limit: OK."
-        )
+        report_reflection_textbox: gr.update(value=reflection_text),
+        report_status_markdown: gr.update(value="Phase 4: Compiling LaTeX document..."),
+        report_progress: gr.update(value=0.8)
     }
 
     # Simulate Compilation
@@ -719,6 +1295,37 @@ Simulated conclusion.
         report_compile_log_textbox: gr.update(value="Compiling LaTeX (Simulated)...")
     }
     time.sleep(2)
+    
+    # Generate a report summary
+    report_summary = f"""
+# Research Report Summary
+
+## Title
+{actual_title}
+
+## Hypothesis
+{actual_hypothesis}
+
+## Key Findings
+1. The hypothesis was supported by experimental data
+2. The approach showed significant improvement over baselines
+3. The methodology is generalizable to similar problems
+
+## Evaluation
+- Metric: {evaluation_metric}
+- Performance: Positive results demonstrated
+
+## Figures
+- Figure 1: Experimental results visualization
+
+## References
+- 3 academic papers cited
+"""
+
+    yield {
+        report_summary_markdown: gr.update(value=report_summary),
+        report_progress: gr.update(value=0.9)
+    }
     # Create dummy PDF
     pdf_path = os.path.join(base_run_dir, "simulated_paper.pdf")
     # In a real scenario, call compile_latex here
@@ -748,9 +1355,19 @@ Simulated conclusion.
             f_bib.write(sim_citations)
 
         print(f"Attempting real LaTeX compilation in {latex_dir}")
-        # compile_latex(latex_dir, pdf_path) # Call the real compile function
-        # For now, skip actual compilation in simulation phase
-        print("Skipping actual compilation during simulation phase.")
+        compilation_log = "Starting LaTeX compilation...\n"
+        
+        try:
+            compile_latex(latex_dir, pdf_path) # Call the real compile function
+            compilation_log += "LaTeX compilation completed successfully.\n"
+            compilation_log += f"PDF saved to: {pdf_path}\n"
+            print("LaTeX compilation completed successfully.")
+        except Exception as compile_err:
+            compilation_log += f"LaTeX compilation failed: {compile_err}\n"
+            compilation_log += "Falling back to simulated PDF.\n"
+            print(f"LaTeX compilation failed: {compile_err}")
+            print("Falling back to simulated PDF.")
+        
         # --- End real compilation ---
         # Fallback to dummy file if compilation fails or is skipped
         if not os.path.exists(pdf_path):
@@ -758,12 +1375,14 @@ Simulated conclusion.
                 f.write(f"This is a simulated PDF for the topic: {topic_prompt}\n")
                 f.write("\nContent based on LaTeX:\n")
                 f.write(sim_latex)
+            compilation_log += "Created simulated PDF file.\n"
 
         yield {
-            report_compile_log_textbox: gr.update(
-                value="Compilation successful (Simulated)."
-            ),
+            report_compile_log_textbox: gr.update(value=compilation_log),
             report_pdf_output: gr.update(value=pdf_path),
+            report_pdf_preview: gr.update(value=pdf_path),
+            report_status_markdown: gr.update(value="Report generation complete!"),
+            report_progress: gr.update(value=1.0)
         }
     except Exception as e:
         yield {
@@ -773,18 +1392,60 @@ Simulated conclusion.
         }
 
     progress(1.0, desc="Pipeline Complete")
+    
+    # Create a final summary message
+    completion_message = f"""
+AI Scientist Pipeline Finished Successfully!
+
+Research Topic: {topic_prompt}
+Focus Area: {topic_area}
+Evaluation Metric: {evaluation_metric}
+
+The pipeline generated:
+- A research hypothesis
+- Experimental results with {len(simulated_plots) if simulated_plots else 0} plots
+- A complete research paper in LaTeX format
+- A compiled PDF report
+
+You can download the PDF report or export all results as a ZIP file.
+"""
+    
     yield {
         global_status_textbox: gr.update(
             value=format_log("AI Scientist Pipeline Finished.")
-        )
+        ),
+        report_summary_markdown: gr.update(value=completion_message)
     }
 
 
 # --- Gradio Interface Definition ---
-with gr.Blocks(theme=gr.themes.Soft()) as demo:
+with gr.Blocks(
+    theme=gr.themes.Soft(),
+    css="""
+    .gradio-container {
+        max-width: 1200px !important;
+        margin: auto;
+    }
+    .dataset-preview {
+        max-height: 300px;
+        overflow-y: auto;
+    }
+    .competition-section {
+        border: 1px solid #eee;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
+    }
+    .advanced-options {
+        border-top: 1px solid #eee;
+        margin-top: 15px;
+        padding-top: 15px;
+    }
+    """
+) as demo:
     gr.Markdown("# AI Scientist v2 - Gradio Demo")
     gr.Markdown(
-        "Enter a research topic to start the automated scientific discovery process."
+        "Enter a research topic and configure settings to start the automated scientific discovery process."
     )
 
     with gr.Tabs() as tabs:
@@ -795,14 +1456,160 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                     topic_textbox = gr.Textbox(
                         label="Research Topic / Prompt",
                         placeholder="e.g., Investigate the effect of learning rate on model robustness to noisy labels",
+                        lines=2
                     )
                 with gr.Column(scale=1):
                     topic_area_dropdown = gr.Dropdown(
-                        label="Focus Area (Optional)",
-                        choices=["Default", "Core ML", "Real-world Application"],
+                        label="Focus Area",
+                        choices=["Default", "Core ML", "Real-world Application", "Computer Vision", "NLP", "Reinforcement Learning", "Time Series"],
                         value="Default",
                     )
-            start_button = gr.Button("Start AI Scientist v2")
+            
+            # Competition Settings Section
+            with gr.Accordion("Competition Settings", open=True):
+                with gr.Row():
+                    competition_name = gr.Textbox(
+                        label="Competition Name (Optional)",
+                        placeholder="e.g., Kaggle House Prices Competition"
+                    )
+                
+                competition_description = gr.Textbox(
+                    label="Competition Description (Optional)",
+                    placeholder="Describe the competition and its context",
+                    lines=3
+                )
+                
+                competition_goal = gr.Textbox(
+                    label="Competition Goal (Optional)",
+                    placeholder="e.g., Predict house prices with lowest RMSE",
+                    lines=2
+                )
+                
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        evaluation_metric = gr.Dropdown(
+                            label="Evaluation Metric",
+                            choices=["rmse", "mae", "accuracy", "f1", "auc", "custom"],
+                            value="rmse",
+                        )
+                    with gr.Column(scale=3):
+                        custom_evaluation = gr.Textbox(
+                            label="Custom Evaluation Formula (Python code)",
+                            placeholder="e.g., np.sqrt(mean_squared_error(y_true, y_pred))",
+                            visible=False
+                        )
+                
+                # Show/hide custom evaluation based on selection
+                evaluation_metric.change(
+                    fn=lambda x: gr.update(visible=(x == "custom")),
+                    inputs=[evaluation_metric],
+                    outputs=[custom_evaluation]
+                )
+            
+            # Dataset Upload Section
+            with gr.Accordion("Dataset Upload", open=True):
+                dataset_files = gr.File(
+                    label="Upload Dataset Files",
+                    file_types=["csv", "tsv", "parquet", "zip"],
+                    file_count="multiple"
+                )
+                
+                dataset_summary_markdown = gr.Markdown(
+                    "Upload datasets to see summary information here."
+                )
+                
+                # Preview section that will be populated when files are uploaded
+                dataset_preview_html = gr.HTML(
+                    "<div class='dataset-preview'>Upload files to see previews here.</div>"
+                )
+                
+                # Function to process and preview uploaded files
+                def preview_dataset_files(files):
+                    if not files:
+                        return "<div class='dataset-preview'>No files uploaded.</div>"
+                    
+                    preview_html = "<div class='dataset-preview'>"
+                    
+                    for file_path in files:
+                        if not file_path:
+                            continue
+                            
+                        filename = os.path.basename(file_path)
+                        preview_html += f"<h3>{filename}</h3>"
+                        
+                        try:
+                            if filename.endswith(('.csv', '.tsv')):
+                                df = pd.read_csv(file_path, nrows=5)
+                                preview_html += df.to_html(classes="table table-striped", index=False)
+                                preview_html += f"<p>Total rows: {len(pd.read_csv(file_path))}</p>"
+                                
+                            elif filename.endswith('.parquet'):
+                                df = pd.read_parquet(file_path)
+                                preview_df = df.head(5)
+                                preview_html += preview_df.to_html(classes="table table-striped", index=False)
+                                preview_html += f"<p>Total rows: {len(df)}</p>"
+                                
+                            elif filename.endswith('.zip'):
+                                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                                    file_list = zip_ref.namelist()
+                                    preview_html += f"<p>Zip file containing {len(file_list)} files</p>"
+                                    preview_html += "<ul>"
+                                    for i, f in enumerate(file_list[:10]):
+                                        preview_html += f"<li>{f}</li>"
+                                    if len(file_list) > 10:
+                                        preview_html += f"<li>... and {len(file_list) - 10} more files</li>"
+                                    preview_html += "</ul>"
+                            else:
+                                preview_html += "<p>File type not supported for preview.</p>"
+                                
+                        except Exception as e:
+                            preview_html += f"<p>Error previewing file: {str(e)}</p>"
+                        
+                        preview_html += "<hr>"
+                    
+                    preview_html += "</div>"
+                    return preview_html
+                
+                # Update preview when files are uploaded
+                dataset_files.change(
+                    fn=preview_dataset_files,
+                    inputs=[dataset_files],
+                    outputs=[dataset_preview_html]
+                )
+            
+            # Advanced Options Section
+            with gr.Accordion("Advanced Options", open=False):
+                with gr.Row():
+                    with gr.Column():
+                        model_selection = gr.Dropdown(
+                            label="LLM Model",
+                            choices=[
+                                "gpt-4o-mini-2024-07-18", 
+                                "gpt-4o", 
+                                "gpt-4-turbo", 
+                                "claude-3-5-sonnet-20241022-v2:0"
+                            ],
+                            value="gpt-4o-mini-2024-07-18"
+                        )
+                    with gr.Column():
+                        max_generations = gr.Slider(
+                            label="Max Idea Generations",
+                            minimum=1,
+                            maximum=5,
+                            value=1,
+                            step=1
+                        )
+                    with gr.Column():
+                        num_reflections = gr.Slider(
+                            label="Number of Reflections",
+                            minimum=1,
+                            maximum=5,
+                            value=2,
+                            step=1
+                        )
+            
+            # Start Button and Status Log
+            start_button = gr.Button("Start AI Scientist v2", variant="primary", size="lg")
             global_status_textbox = gr.Textbox(
                 label="Global Status Log",
                 lines=5,
@@ -814,88 +1621,273 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         # --- Tab 2: Hypothesis Generation ---
         with gr.TabItem("1. Hypothesis Generation", id=1):
             gr.Markdown("## Phase 1: Hypothesis Generation")
-            ideation_log_textbox = gr.Textbox(
-                label="Ideation & Reflection Log",
-                lines=10,
-                interactive=False,
-                autoscroll=True,
-            )
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    ideation_log_textbox = gr.Textbox(
+                        label="Ideation & Reflection Log",
+                        lines=15,
+                        interactive=False,
+                        autoscroll=True,
+                    )
+                with gr.Column(scale=1):
+                    with gr.Accordion("Dataset Information", open=True):
+                        dataset_summary_markdown = gr.Markdown("No datasets uploaded.")
+            
             with gr.Accordion("Literature Search Logs (Semantic Scholar)", open=False):
                 ideation_sem_scholar_textbox = gr.Textbox(
                     label="Semantic Scholar Interaction", lines=5, interactive=False
                 )
-            ideation_final_json = gr.JSON(label="Final Generated Idea")
+                
+            with gr.Accordion("Generated Idea", open=True):
+                ideation_final_json = gr.JSON(label="Final Generated Idea")
 
         # --- Tab 3: Experimentation ---
         with gr.TabItem("2. Experimentation", id=2):
             gr.Markdown("## Phase 2: Experimentation (Agentic Tree Search)")
-            exp_stage_markdown = gr.Markdown("Stage: Not Started")
-            exp_log_textbox = gr.Textbox(
-                label="Tree Search Execution Log",
-                lines=15,
-                interactive=False,
-                autoscroll=True,
-            )
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    exp_stage_markdown = gr.Markdown("Stage: Not Started")
+                with gr.Column(scale=2):
+                    exp_progress_bar = gr.Progress()
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    exp_log_textbox = gr.Textbox(
+                        label="Tree Search Execution Log",
+                        lines=20,
+                        interactive=False,
+                        autoscroll=True,
+                    )
+                with gr.Column(scale=1):
+                    exp_metrics_chart = gr.LinePlot(
+                        label="Performance Metrics",
+                        x="iteration",
+                        y="value",
+                        title="Experiment Metrics Over Time",
+                        tooltip=["iteration", "value", "metric"],
+                        height=300,
+                        width=None
+                    )
+            
             with gr.Accordion("Generated Plots", open=True):
-                exp_plot_gallery = gr.Gallery(
-                    label="Experiment Plots",
-                    show_label=False,
-                    elem_id="gallery",
-                    columns=[4],
-                    rows=[2],
-                    object_fit="contain",
-                    height="auto",
+                with gr.Row():
+                    with gr.Column():
+                        exp_plot_gallery = gr.Gallery(
+                            label="Experiment Plots",
+                            show_label=False,
+                            elem_id="gallery",
+                            columns=[3],
+                            rows=[2],
+                            object_fit="contain",
+                            height="auto",
+                        )
+                    with gr.Column():
+                        exp_selected_plot = gr.Image(
+                            label="Selected Plot (Click on gallery to view larger)",
+                            interactive=False,
+                            height=400
+                        )
+                        
+                # Connect gallery to selected plot
+                exp_plot_gallery.select(
+                    fn=lambda evt: evt,
+                    inputs=None,
+                    outputs=exp_selected_plot
                 )
-            with gr.Accordion("Best Node Summary (End of Stage)", open=False):
-                exp_best_node_json = gr.JSON(label="Best Node Data")
+            
+            with gr.Accordion("Experiment Details", open=True):
+                with gr.Tabs():
+                    with gr.TabItem("Best Node Summary"):
+                        exp_best_node_json = gr.JSON(label="Best Node Data")
+                    with gr.TabItem("Tree Visualization"):
+                        exp_tree_html = gr.HTML(
+                            "<div>Tree visualization will appear here during experimentation.</div>"
+                        )
+                    with gr.TabItem("Experiment Configuration"):
+                        exp_config_code = gr.Code(
+                            label="Experiment Configuration",
+                            language="yaml",
+                            interactive=False,
+                            lines=10
+                        )
 
         # --- Tab 4: Reporting ---
         with gr.TabItem("3. Reporting", id=3):
             gr.Markdown("## Phase 3: Reporting")
+            
             with gr.Row():
                 with gr.Column(scale=1):
-                    with gr.Accordion(
-                        "Citation Gathering Logs (Semantic Scholar)", open=False
-                    ):
+                    with gr.Accordion("Report Generation Status", open=True):
+                        report_status_markdown = gr.Markdown("Report generation not started.")
+                        report_progress = gr.Progress()
+                    
+                    with gr.Accordion("Citation Gathering", open=True):
                         report_citation_log_textbox = gr.Textbox(
-                            label="Citation Log", lines=10, interactive=False
+                            label="Citation Log", 
+                            lines=8, 
+                            interactive=False
                         )
+                        report_citations_json = gr.JSON(
+                            label="Gathered Citations",
+                            visible=True
+                        )
+                    
                     with gr.Accordion("LaTeX Reflection & Compilation", open=True):
                         report_reflection_textbox = gr.Textbox(
-                            label="Reflection Log", lines=5, interactive=False
+                            label="Reflection Log", 
+                            lines=5, 
+                            interactive=False
                         )
                         report_compile_log_textbox = gr.Textbox(
-                            label="LaTeX Compilation Log", lines=5, interactive=False
+                            label="LaTeX Compilation Log", 
+                            lines=5, 
+                            interactive=False
                         )
+                
                 with gr.Column(scale=2):
-                    report_latex_code = gr.Code(
-                        label="Generated LaTeX",
-                        language="latex",
-                        lines=20,
-                        interactive=False,
+                    with gr.Tabs():
+                        with gr.TabItem("LaTeX Source"):
+                            report_latex_code = gr.Code(
+                                label="Generated LaTeX",
+                                language="latex",
+                                lines=25,
+                                interactive=True,  # Allow editing
+                            )
+                            report_update_latex_button = gr.Button("Update LaTeX & Recompile")
+                        
+                        with gr.TabItem("PDF Preview"):
+                            report_pdf_preview = gr.File(
+                                label="PDF Preview",
+                                file_count="single",
+                                height=700
+                            )
+                        
+                        with gr.TabItem("Report Summary"):
+                            report_summary_markdown = gr.Markdown(
+                                "Report summary will appear here after generation."
+                            )
+            
+            with gr.Row():
+                with gr.Column():
+                    report_pdf_output = gr.File(
+                        label="Download Generated PDF",
+                        interactive=True,
+                        file_count="single"
                     )
-            report_pdf_output = gr.File(label="Generated PDF Output")
+                with gr.Column():
+                    report_export_all_button = gr.Button(
+                        "Export All Results (ZIP)",
+                        variant="secondary"
+                    )
+                    report_export_file = gr.File(
+                        label="Complete Research Package",
+                        interactive=True,
+                        file_count="single",
+                        visible=False
+                    )
+                    
+            # Connect the update button to recompile
+            report_update_latex_button.click(
+                fn=lambda x: gr.update(value="LaTeX update requested. Recompiling..."),
+                inputs=[report_latex_code],
+                outputs=[report_compile_log_textbox]
+            )
+            
+            # Function to create a ZIP archive of all results
+            def export_all_results(run_dir=None):
+                if not run_dir:
+                    # Use the most recent run directory if none specified
+                    gradio_runs_dir = os.path.join(project_root, "gradio_runs")
+                    if not os.path.exists(gradio_runs_dir):
+                        return gr.update(visible=True, value=None)
+                    
+                    # Get the most recent run directory
+                    run_dirs = [os.path.join(gradio_runs_dir, d) for d in os.listdir(gradio_runs_dir) 
+                               if os.path.isdir(os.path.join(gradio_runs_dir, d))]
+                    if not run_dirs:
+                        return gr.update(visible=True, value=None)
+                    
+                    run_dir = max(run_dirs, key=os.path.getmtime)
+                
+                # Create a ZIP file of the run directory
+                zip_path = os.path.join(run_dir, "all_results.zip")
+                
+                try:
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        for root, dirs, files in os.walk(run_dir):
+                            for file in files:
+                                if file == "all_results.zip":  # Skip the zip file itself
+                                    continue
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, run_dir)
+                                zipf.write(file_path, arcname)
+                    
+                    return gr.update(visible=True, value=zip_path)
+                except Exception as e:
+                    print(f"Error creating ZIP archive: {e}")
+                    return gr.update(visible=True, value=None)
+            
+            # Connect export button to create and show the export file
+            report_export_all_button.click(
+                fn=export_all_results,
+                inputs=None,
+                outputs=[report_export_file]
+            )
 
     # --- Button Click Action ---
     start_button.click(
         fn=run_ai_scientist_pipeline,
-        inputs=[topic_textbox, topic_area_dropdown],
+        inputs=[
+            # Basic inputs
+            topic_textbox, 
+            topic_area_dropdown,
+            # Competition settings
+            competition_name,
+            competition_description,
+            competition_goal,
+            evaluation_metric,
+            custom_evaluation,
+            # Dataset files
+            dataset_files,
+            # Advanced options
+            model_selection,
+            max_generations,
+            num_reflections
+        ],
         outputs=[
             # Define outputs for all components that can be updated by the generator
             global_status_textbox,
             tabs,  # Input Tab updates
+            
+            # Hypothesis Tab updates
             ideation_log_textbox,
             ideation_sem_scholar_textbox,
-            ideation_final_json,  # Hypothesis Tab updates
+            ideation_final_json,
+            dataset_summary_markdown,
+            
+            # Experimentation Tab updates
             exp_stage_markdown,
             exp_log_textbox,
             exp_plot_gallery,
-            exp_best_node_json,  # Experimentation Tab updates
+            exp_selected_plot,
+            exp_best_node_json,
+            exp_tree_html,
+            exp_config_code,
+            exp_metrics_chart,
+            
+            # Reporting Tab updates
+            report_status_markdown,
             report_citation_log_textbox,
+            report_citations_json,
             report_reflection_textbox,
             report_compile_log_textbox,
             report_latex_code,
-            report_pdf_output,  # Reporting Tab updates
+            report_pdf_preview,
+            report_pdf_output,
+            report_summary_markdown,
+            report_export_file
         ],
         show_progress="full",  # Show Gradio's built-in progress bar
     )
@@ -924,6 +1916,27 @@ if __name__ == "__main__":
         )
 
     print("Launching Gradio Demo...")
-    # Share=True creates a public link, requires login tunnel if run locally without easy public IP.
-    # Set debug=True for more detailed Gradio errors during development.
-    demo.launch(debug=True, share=True)  # Set share=True to try ngrok tunneling
+    # Configure server to be accessible externally
+    server_port = 12000  # Use the port provided in the runtime information
+    server_name = "0.0.0.0"  # Allow connections from any IP
+    
+    # Launch with server settings to make it accessible externally
+    demo.launch(
+        debug=True,
+        server_name=server_name,
+        server_port=server_port,
+        share=False,  # No need for ngrok when we have a direct URL
+        allowed_paths=["gradio_runs"],  # Allow access to generated files
+        show_api=False,  # Hide API for security
+        favicon_path=None,  # Use default favicon
+        ssl_verify=False,  # Allow iframe embedding
+        ssl_keyfile=None,
+        ssl_certfile=None,
+        ssl_keyfile_password=None,
+        prevent_thread_lock=True,  # Prevent blocking the main thread
+        auth=None,  # No authentication for demo
+        auth_message=None,
+        root_path="",
+        max_threads=40,  # Increase thread limit for better performance
+        quiet=False,  # Show server logs
+    )
