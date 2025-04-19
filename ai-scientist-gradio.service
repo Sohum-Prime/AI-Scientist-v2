@@ -1,0 +1,14 @@
+[Unit]
+Description=AI Scientist v2 Gradio Web Interface
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/workspace/AI-Scientist-v2
+ExecStart=/workspace/AI-Scientist-v2/start_app.sh
+Restart=on-failure
+RestartSec=5s
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
