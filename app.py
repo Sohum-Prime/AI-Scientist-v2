@@ -10,6 +10,10 @@ import shutil
 import re
 from io import StringIO
 import contextlib
+import threading  # To run experiments in the background
+import yaml  # To read/write bfts_config.yaml
+from pathlib import Path  # For easier path manipulation
+
 
 # --- Add AI Scientist Project Root to Python Path ---
 # Assuming app.py is in the root of your cloned repository
@@ -45,10 +49,20 @@ from ai_scientist.perform_vlm_review import (
 
 # --- Helper Functions ---
 def get_timestamp():
+    """Returns the current timestamp as a string in the format %Y-%m-%d_%H-%M-%S."""
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
 def format_log(message, level="INFO"):
+    """Formats a message as a log entry with timestamp and level.
+
+    Args:
+        message: The message to be logged.
+        level (str): The log level, default is "INFO".
+
+    Returns:
+        str: The formatted log entry.
+    """
     return f"{datetime.now().strftime('%H:%M:%S')} [{level}] {message}\n"
 
 
@@ -109,10 +123,188 @@ def parse_ideation_logs(captured_output):
     return general_log.strip(), sem_scholar_log.strip()
 
 
+# --- New Helper for Experimentation Monitoring ---
+def monitor_experiment_progress(run_dir, yield_updates_func):
+    """
+    Monitors the experiment directory for logs and plots, yielding updates.
+    Args:
+        run_dir (str): The base directory for the Gradio run.
+        yield_updates_func (function): A function to call with updates for Gradio.
+    """
+    exp_log_dir = Path(run_dir) / "logs" / "0-run"  # Standard output path from bfts
+    journal_file = exp_log_dir / "journal.jsonl"
+    results_dir = exp_log_dir / "experiment_results"  # Where plots often end up
+
+    print(f"Monitoring experiment progress in: {exp_log_dir}")
+
+    last_log_pos = 0
+    last_plot_mtime = 0
+    current_plots = []
+    last_stage = "Not Started"
+    stages_seen = set()
+
+    # Allow some time for the experiment thread to start and create files
+    time.sleep(5)
+
+    experiment_running = True  # Assume it's running initially
+    max_wait_cycles = 20  # Max cycles (100s) to wait without any file changes before assuming completion/stall
+    no_change_cycles = 0
+
+    while experiment_running:
+        made_update = False
+
+        # 1. Check for new log entries in journal.jsonl
+        if journal_file.exists():
+            try:
+                with open(journal_file, "r") as f:
+                    f.seek(last_log_pos)
+                    new_log_lines = f.readlines()
+                    last_log_pos = f.tell()
+
+                if new_log_lines:
+                    made_update = True
+                    no_change_cycles = 0  # Reset counter
+                    log_update = ""
+                    for line in new_log_lines:
+                        try:
+                            log_entry = json.loads(line)
+                            # Extract relevant info (customize as needed)
+                            msg = log_entry.get("message", "")
+                            node_id = log_entry.get("node_id")
+                            stage = log_entry.get(
+                                "stage", last_stage
+                            )  # Get stage if available
+                            status = log_entry.get("status")
+                            metrics = log_entry.get("metric")
+                            error = log_entry.get("error")
+
+                            # Update Stage display if changed
+                            if stage != last_stage and stage not in stages_seen:
+                                last_stage = stage
+                                stages_seen.add(stage)
+                                yield_updates_func(
+                                    {
+                                        exp_stage_markdown: gr.update(
+                                            value=f"Stage: {stage}"
+                                        )
+                                    }
+                                )
+                                log_update += format_log(
+                                    f"--- Entering Stage: {stage} ---"
+                                )
+
+                            # Format log message
+                            log_line = f"Node {node_id}: {msg}" if node_id else msg
+                            if status:
+                                log_line += f" | Status: {status}"
+                            if metrics:
+                                log_line += (
+                                    f" | Metrics: {metrics:.4f}"
+                                    if isinstance(metrics, float)
+                                    else f" | Metrics: {metrics}"
+                                )
+                            if error:
+                                log_line += f" | Error: {error}"
+
+                            log_update += format_log(log_line, level="EXP")
+
+                        except json.JSONDecodeError:
+                            log_update += format_log(
+                                f"Raw Log: {line.strip()}", level="DEBUG"
+                            )
+                        except Exception as parse_err:
+                            log_update += format_log(
+                                f"Log Parse Error: {parse_err}", level="WARN"
+                            )
+
+                    yield_updates_func(
+                        {exp_log_textbox: gr.update(value=log_update, append=True)}
+                    )  # Append logs
+            except Exception as log_err:
+                print(f"Error reading journal file: {log_err}")
+                # Avoid spamming logs if file temporarily unavailable
+                time.sleep(2)
+
+        # 2. Check for new plot files in experiment_results (or subdirs)
+        new_plots_found = []
+        latest_mtime = last_plot_mtime
+        if results_dir.exists():
+            try:
+                # Check recursively for png files, get modification time
+                for plot_file in results_dir.rglob("*.png"):
+                    mtime = plot_file.stat().st_mtime
+                    if mtime > last_plot_mtime:
+                        if str(plot_file) not in current_plots:
+                            new_plots_found.append(str(plot_file))
+                    if mtime > latest_mtime:
+                        latest_mtime = mtime
+
+                if new_plots_found:
+                    made_update = True
+                    no_change_cycles = 0  # Reset counter
+                    current_plots.extend(new_plots_found)
+                    last_plot_mtime = latest_mtime  # Update to the latest mtime found
+                    yield_updates_func(
+                        {
+                            exp_plot_gallery: gr.update(value=current_plots),
+                            exp_log_textbox: gr.update(
+                                value=format_log(
+                                    f"Found new plots: {', '.join(os.path.basename(p) for p in new_plots_found)}"
+                                ),
+                                append=True,
+                            ),
+                        }
+                    )
+            except Exception as plot_err:
+                print(f"Error scanning for plots: {plot_err}")
+
+        # 3. Check for completion / stall
+        # Simple heuristic: if no file changes detected for a while, assume done or stalled.
+        # A more robust method would be to check thread status or look for a completion marker file.
+        if not made_update:
+            no_change_cycles += 1
+        else:
+            no_change_cycles = 0
+
+        if no_change_cycles >= max_wait_cycles:
+            print(
+                f"No file changes detected for {max_wait_cycles * 5} seconds. Assuming experiment completion or stall."
+            )
+            yield_updates_func(
+                {
+                    exp_log_textbox: gr.update(
+                        value=format_log("Monitoring stopped (timeout/completion)."),
+                        append=True,
+                    )
+                }
+            )
+            experiment_running = False
+
+        # TODO: Add a more reliable way to detect experiment completion.
+        # For example, the thread could write a ".done" file.
+        if (exp_log_dir / ".experiment_done").exists():
+            print("Detected .experiment_done file. Stopping monitoring.")
+            yield_updates_func(
+                {
+                    exp_log_textbox: gr.update(
+                        value=format_log("Experiment finished."), append=True
+                    )
+                }
+            )
+            experiment_running = False
+
+        if experiment_running:
+            time.sleep(5)  # Poll every 5 seconds
+
+    print("Experiment monitoring finished.")
+    # Return final state or collected results if needed (e.g., best node summary)
+    # For now, just signal completion
+    return {"status": "completed", "plots": current_plots}
+
+
 # --- Main AI Scientist Orchestration Logic ---
 
 
-# Placeholder for the actual logic - we will fill this in
 def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
     """
     Main generator function to run the AI Scientist pipeline and yield updates.
@@ -261,106 +453,145 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
         global_status_textbox: gr.update(
             value=format_log("Starting Phase 2: Experimentation...")
         ),
-        # Clear previous phase outputs
-        exp_stage_markdown: gr.update(value="Stage: Not Started"),
+        exp_stage_markdown: gr.update(value="Stage: Preparing..."),
         exp_log_textbox: gr.update(value=""),
         exp_plot_gallery: gr.update(value=None),
         exp_best_node_json: gr.update(value=None),
-        # Switch to the Experimentation tab
         tabs: gr.update(selected=2),
     }
-    progress(0.3, desc="Running Experiments (Simulated Tree Search)")
+    progress(0.3, desc="Preparing Experiments")
 
-    exp_log = format_log("Starting Experimentation Tree Search...")
+    exp_log = format_log("Preparing configuration for experiments...")
     yield {exp_log_textbox: exp_log}
 
-    # TODO: Integrate actual experimentation call (or refined simulation)
-    # Simulate stages and node execution
-    stages = [
-        "Preliminary Investigation",
-        "Hyperparameter Tuning",
-        "Research Agenda Execution",
-        "Ablation Studies",
-    ]
-    simulated_plots = []
-    for i, stage in enumerate(stages):
-        yield {exp_stage_markdown: gr.update(value=f"Stage: {stage}")}
-        exp_log += format_log(f"--- Entering Stage: {stage} ---")
-        yield {exp_log_textbox: exp_log}
-        for node_idx in range(3):  # Simulate a few nodes per stage
-            progress(
-                0.3 + (i * 3 + node_idx + 1) * (0.5 / (len(stages) * 3)),
-                desc=f"Running {stage} - Node {node_idx+1}",
-            )
-            exp_log += format_log(f"Generating Node {i+1}-{node_idx+1}...")
-            yield {exp_log_textbox: exp_log}
-            time.sleep(0.5)
-            exp_log += format_log(f"Executing Node {i+1}-{node_idx+1}...")
-            yield {exp_log_textbox: exp_log}
-            time.sleep(1)
-            is_buggy = (i + node_idx) % 4 == 1  # Simulate some bugs
-            if is_buggy:
-                exp_log += format_log(
-                    f"Node {i+1}-{node_idx+1} FAILED. Error: Simulated ValueError.",
-                    level="ERROR",
-                )
-                yield {exp_log_textbox: exp_log}
-            else:
-                exp_log += format_log(
-                    f"Node {i+1}-{node_idx+1} SUCCESS. Metric: {0.8 - i*0.05 - node_idx*0.02:.2f}"
-                )
-                # Simulate plot generation
-                plot_path = os.path.join(
-                    base_run_dir, f"sim_plot_s{i+1}_n{node_idx+1}.png"
-                )
-                # Create a dummy plot file (replace with actual plot generation if needed)
-                from PIL import Image, ImageDraw
+    # Prepare configuration for perform_experiments_bfts
+    base_config_path = os.path.join(project_root, "bfts_config.yaml")
+    run_config_path = os.path.join(base_run_dir, "bfts_config.yaml")
+    final_idea_path = os.path.join(
+        base_run_dir, "idea.json"
+    )  # Path where we saved the idea
 
-                img = Image.new("RGB", (300, 200), color=(73, 109, 137))
-                d = ImageDraw.Draw(img)
-                d.text(
-                    (10, 10),
-                    f"Simulated Plot\nStage {i+1}, Node {node_idx+1}",
-                    fill=(255, 255, 0),
-                )
-                img.save(plot_path)
-                simulated_plots.append(plot_path)
-                exp_log += format_log(f"Generated plot: {os.path.basename(plot_path)}")
-                exp_log += format_log(
-                    f"VLM Feedback: Plot looks reasonable (Simulated)"
-                )
-                yield {exp_log_textbox: exp_log, exp_plot_gallery: simulated_plots}
-            time.sleep(0.5)
-        # Simulate selecting best node
-        exp_log += format_log(f"Selecting best node for stage {stage}...")
-        yield {exp_log_textbox: exp_log}
-        time.sleep(0.5)
-        best_node_sim = {
-            "stage": stage,
-            "best_metric": 0.8 - i * 0.05,
-            "selected_node": f"{i+1}-0",
+    if not os.path.exists(final_idea_path):
+        error_msg = format_log(
+            "Experimentation FAILED: idea.json not found.", level="ERROR"
+        )
+        yield {
+            global_status_textbox: gr.update(value=error_msg),
+            exp_log_textbox: gr.update(value=exp_log + error_msg),
         }
-        yield {exp_best_node_json: best_node_sim}
+        return
 
-    # Simulate final plot aggregation step within experimentation phase (as per original code)
-    exp_log += format_log("Aggregating final plots...")
-    yield {exp_log_textbox: exp_log}
-    time.sleep(1)
-    # Add a dummy aggregated plot
-    agg_plot_path = os.path.join(base_run_dir, "sim_plot_aggregated.png")
-    img = Image.new("RGB", (400, 300), color=(137, 73, 109))
-    d = ImageDraw.Draw(img)
-    d.text((10, 10), f"Simulated Aggregated Plot", fill=(255, 255, 0))
-    img.save(agg_plot_path)
-    simulated_plots.append(agg_plot_path)
-    yield {exp_plot_gallery: simulated_plots}
-    exp_log += format_log("Plot aggregation complete.")
-    yield {exp_log_textbox: exp_log}
+    try:
+        # Edit the config file to point to the specific run directory and idea file
+        # This function creates a copy in base_run_dir and modifies it
+        modified_config_path = edit_bfts_config_file(
+            config_path=base_config_path,
+            exp_dir=base_run_dir,  # Pass the Gradio run directory
+            idea_path=final_idea_path,
+            new_config_path=run_config_path,  # Save the modified config here
+        )
+        exp_log += format_log(
+            f"Experiment configuration saved to {modified_config_path}"
+        )
+        yield {exp_log_textbox: exp_log}
 
-    experiment_results = {
-        "summary": "Simulated experiment results",
-        "plot_paths": simulated_plots,
-    }  # Pass info
+        # --- Function to run the experiment in a separate thread ---
+        experiment_thread_result = {}  # To store results or exceptions
+
+        def experiment_runner(config_path, result_dict):
+            try:
+                print(
+                    f"\n--- [Thread] Starting perform_experiments_bfts with config: {config_path} ---"
+                )
+                # Make sure the function knows where the project root is if it relies on relative paths
+                os.environ["AI_SCIENTIST_ROOT"] = project_root
+                perform_experiments_bfts(config_path)
+                result_dict["status"] = "success"
+                print("--- [Thread] perform_experiments_bfts finished ---")
+                # Signal completion by creating a file
+                exp_log_dir = Path(base_run_dir) / "logs" / "0-run"
+                (exp_log_dir / ".experiment_done").touch()
+            except Exception as thread_e:
+                print(
+                    f"--- [Thread] Exception in perform_experiments_bfts: {thread_e} ---"
+                )
+                traceback.print_exc()
+                result_dict["status"] = "error"
+                result_dict["exception"] = thread_e
+                result_dict["traceback"] = traceback.format_exc()
+                # Signal completion even on error
+                exp_log_dir = Path(base_run_dir) / "logs" / "0-run"
+                (exp_log_dir / ".experiment_done").touch()
+
+        # Start the experiment thread
+        exp_thread = threading.Thread(
+            target=experiment_runner,
+            args=(modified_config_path, experiment_thread_result),
+        )
+        exp_thread.start()
+        print("Experiment thread started.")
+        exp_log += format_log("Experiment thread started. Monitoring progress...")
+        yield {exp_log_textbox: exp_log}
+
+        # --- Monitor progress using the helper function ---
+        # Define a callback function for the monitor to send updates to Gradio
+        # Use a queue or direct yield if possible, but direct yield from monitor might be tricky with threading
+        # Let's try yielding directly for now, might need adjustment
+        def yield_gradio_updates(update_dict):
+            # This function will be called by the monitor thread
+            # We need a way to pass this back to the main Gradio generator's yield
+            # THIS IS THE TRICKY PART - direct yield won't work across threads.
+            # Workaround: Store updates and have main thread yield them (less real-time)
+            # Or use Gradio's queue/API mode if available/necessary.
+            # For simplicity now, we'll just print updates from the monitor thread.
+            # In a more robust app, use thread-safe queues.
+            print(f"[Monitor Update]: {update_dict}")
+            # We will manually yield updates based on monitor return later
+
+        monitor_result = monitor_experiment_progress(
+            base_run_dir, yield_gradio_updates
+        )  # Pass the callback
+
+        # Wait for the experiment thread to finish (optional, monitor handles timeout)
+        # exp_thread.join() # Can block Gradio UI, rely on monitor's timeout instead
+
+        # Check thread result for errors
+        if experiment_thread_result.get("status") == "error":
+            error_msg = format_log(
+                f"Experimentation FAILED: {experiment_thread_result.get('exception')}",
+                level="ERROR",
+            )
+            tb_str = experiment_thread_result.get("traceback", "")
+            yield {
+                global_status_textbox: gr.update(value=error_msg),
+                exp_log_textbox: gr.update(
+                    value=f"\n{error_msg}\nTraceback:\n{tb_str}", append=True
+                ),
+            }
+            return
+
+        yield {
+            global_status_textbox: gr.update(
+                value=format_log("Phase 2: Experimentation COMPLETE.")
+            )
+        }
+        print("Experimentation phase finished.")
+        # Process monitor_result if needed (e.g., get final plot list)
+        simulated_plots = monitor_result.get("plots", [])  # Get actual plots found
+
+    except Exception as e:
+        error_msg = format_log(
+            f"Phase 2: Experimentation FAILED. Error: {e}", level="ERROR"
+        )
+        tb_str = traceback.format_exc()
+        full_log_msg = exp_log + "\n" + error_msg + "\nTraceback:\n" + tb_str
+        yield {
+            global_status_textbox: gr.update(value=error_msg),
+            exp_log_textbox: gr.update(value=full_log_msg),
+        }
+        print(f"Exception during experimentation setup/monitoring: {e}")
+        traceback.print_exc()
+        return  # Stop pipeline
 
     # --- Phase 3: Reporting ---
     yield {
@@ -395,47 +626,72 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
     report_log = ""  # Reset for LaTeX logs
     yield {report_latex_code: gr.update(value="Generating initial LaTeX...")}
     time.sleep(2)
+    # Use the actual generated idea's title and hypothesis if available
+    actual_title = (
+        final_idea.get("Title", "Simulated Title") if final_idea else "Simulated Title"
+    )
+    actual_hypothesis = (
+        final_idea.get("Short Hypothesis", "N/A") if final_idea else "N/A"
+    )
+    actual_abstract = (
+        final_idea.get(
+            "Abstract", f"Simulated abstract based on user prompt: {topic_prompt}"
+        )
+        if final_idea
+        else f"Simulated abstract based on user prompt: {topic_prompt}"
+    )
+
+    # Determine plot path safely - use plots found by monitor
+    last_plot_basename = (
+        os.path.basename(simulated_plots[-1]) if simulated_plots else "placeholder.png"
+    )
+
     sim_latex = (
         r"""\documentclass{article}
-\usepackage{iclr2025_conference,times} % Use workshop style later if needed
+% \usepackage{iclr2025_conference,times} % Use workshop style later if needed
 \usepackage{graphicx}
-\graphicspath{{figures/}} % Point to where Gradio saves plots
+% \graphicspath{{figures/}} % Point to where Gradio saves plots
+% --- Adjust graphicspath for local execution ---
+% Assume plots are in logs/0-run/experiment_results relative to base_run_dir
+% LaTeX runs in base_run_dir/latex, so path needs adjustment
+\graphicspath{{../logs/0-run/experiment_results/}} % Relative path from latex subdir
+% --- End Adjust ---
 \usepackage[utf8]{inputenc}
 \usepackage{hyperref}
 \usepackage{url}
 \title{"""
-        + final_idea.get("Title", "Simulated Title")
+        + actual_title
         + r"""}
 \author{AI Scientist Gradio Demo}
 \begin{document}
 \maketitle
 \begin{abstract}
-Simulated abstract based on user prompt: """
-        + topic_prompt
+"""
+        + actual_abstract
         + r"""
 \end{abstract}
 \section{Introduction}
 Simulated introduction. Hypothesis: """
-        + final_idea.get("Short Hypothesis", "N/A")
+        + actual_hypothesis
         + r"""
 \section{Experiments}
-We ran simulated experiments. See Figure \ref{fig:sim}.
+We ran experiments. See Figure \ref{fig:sim}. % Changed text slightly
 \begin{figure}[h]
 \centering
+% Use the basename of the last plot found by monitor
 \includegraphics[width=0.5\textwidth]{"""
-        + os.path.basename(
-            simulated_plots[-1] if simulated_plots else "placeholder.png"
-        )
+        + last_plot_basename
         + r"""}
-\caption{Simulated aggregated results.}
+\caption{Experiment results.} % Changed caption
 \label{fig:sim}
-\end{{figure}
+\end{figure}
 \section{Conclusion}
 Simulated conclusion.
-\bibliography{iclr2025_conference} % Use a dummy bib file name
-\bibliographystyle{iclr2025_conference}
+\bibliography{references} % Use a standard bib file name
+% \bibliographystyle{iclr2025_conference} % Use standard style for now
+\bibliographystyle{plainnat} % Use plainnat for compatibility
 % --- Simulated Citations ---
-\begin{filecontents}{iclr2025_conference.bib}
+\begin{filecontents}{references.bib}
 """
         + sim_citations
         + """
@@ -467,10 +723,41 @@ Simulated conclusion.
     # In a real scenario, call compile_latex here
     # For simulation, just create a placeholder text file pretending to be PDF
     try:
-        with open(pdf_path, "w") as f:
-            f.write(f"This is a simulated PDF for the topic: {topic_prompt}\n")
-            f.write("\nContent based on LaTeX:\n")
-            f.write(sim_latex)
+        # --- Attempt real compilation if possible ---
+        latex_dir = os.path.join(base_run_dir, "latex")
+        os.makedirs(latex_dir, exist_ok=True)
+        # Copy necessary style files (assuming iclr style is used)
+        blank_latex_dir = os.path.join(
+            project_root, "ai_scientist", "blank_icbinb_latex"
+        )  # Adjust if using different style
+        for style_file in [
+            "iclr2025_conference.bst",
+            "iclr2025_conference.sty",
+            "natbib.sty",
+            "fancyhdr.sty",
+        ]:  # Add necessary files
+            src_path = os.path.join(blank_latex_dir, style_file)
+            if os.path.exists(src_path):
+                shutil.copy(src_path, latex_dir)
+        # Write the generated LaTeX content
+        with open(os.path.join(latex_dir, "template.tex"), "w") as f_tex:
+            f_tex.write(sim_latex)
+        # Write the bib file content (already included via filecontents, but good practice)
+        with open(os.path.join(latex_dir, "references.bib"), "w") as f_bib:
+            f_bib.write(sim_citations)
+
+        print(f"Attempting real LaTeX compilation in {latex_dir}")
+        # compile_latex(latex_dir, pdf_path) # Call the real compile function
+        # For now, skip actual compilation in simulation phase
+        print("Skipping actual compilation during simulation phase.")
+        # --- End real compilation ---
+        # Fallback to dummy file if compilation fails or is skipped
+        if not os.path.exists(pdf_path):
+            with open(pdf_path, "w") as f:
+                f.write(f"This is a simulated PDF for the topic: {topic_prompt}\n")
+                f.write("\nContent based on LaTeX:\n")
+                f.write(sim_latex)
+
         yield {
             report_compile_log_textbox: gr.update(
                 value="Compilation successful (Simulated)."

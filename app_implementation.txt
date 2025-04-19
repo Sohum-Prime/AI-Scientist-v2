@@ -36,19 +36,52 @@
   - If no ideas were generated or an exception occurred, yielded error messages and stopped the pipeline. Added specific check for `ImportError` related to `semantic_scholar`.
 - **Note:** Capturing intermediate states beyond stdout parsing would require modifying `generate_temp_free_idea`.
 
-## Phase 2: Experimentation Integration (Simulation - Unchanged)
-- Kept the simulation logic for Phase 2.
-- Added `try-except` blocks around PIL imports/usage for dummy plot generation to handle cases where PIL might not be installed, preventing crashes.
-- **TODO:** Replace simulation with actual call to `perform_experiments_bfts`.
+## Phase 2: Experimentation Integration (Actual Function Call via Threading & Monitoring)
+- **Replaced** the simulation block for Phase 2.
+- Imported `threading`, `yaml`, `Path`.
+- Imported `perform_experiments_bfts` and `edit_bfts_config_file`.
+- Added `monitor_experiment_progress` helper function:
+    - Takes the Gradio run directory and a (currently placeholder) callback function.
+    - Defines expected log/result paths (`journal.jsonl`, `experiment_results`).
+    - Enters a loop polling for changes:
+        - Reads new lines from `journal.jsonl` since last read position.
+        - Parses JSON log entries, extracts relevant info (stage, node, status, metrics, error).
+        - Updates stage display via callback if stage changes.
+        - Formats and yields log updates via callback.
+        - Scans `experiment_results` recursively for new `.png` files based on modification time.
+        - Updates plot gallery via callback if new plots found.
+        - Includes a simple timeout/stall detection based on lack of file changes.
+        - Includes check for a `.experiment_done` file as a completion signal.
+    - **Note:** Direct yielding from the monitor thread to Gradio is problematic. Current implementation prints monitor updates; main thread yields based on monitor's *return* value. Real-time updates would need queues or Gradio API mode.
+- In `run_ai_scientist_pipeline`:
+    - Added yield to switch to Experimentation tab.
+    - Prepared paths for base config, run-specific config, and final idea JSON.
+    - Called `edit_bfts_config_file` to create a run-specific config pointing to the correct run directory and idea file.
+    - Defined `experiment_runner` function to encapsulate the call to `perform_experiments_bfts` within a thread. Includes basic error handling and touches `.experiment_done` file on completion/error. Sets `AI_SCIENTIST_ROOT` env var for the thread.
+    - Started `experiment_runner` in a `threading.Thread`.
+    - Called `monitor_experiment_progress` to track the run.
+    - **Removed** explicit `thread.join()` to avoid blocking Gradio UI. Relies on monitor timeout/completion signal.
+    - Added check for errors reported back from the thread via `experiment_thread_result`.
+    - Yielded final completion status.
+    - Updated the subsequent (still simulated) Reporting phase to use the list of plots found by the monitor (`simulated_plots = monitor_result.get("plots", [])`).
+- **Safety:** Acknowledged local execution risk without explicit sandboxing.
 
 ## Phase 3: Reporting Integration (Simulation - Minor Update)
 - Kept the simulation logic for Phase 3.
-- Updated the simulated LaTeX generation to use the actual `final_idea` dictionary (if generated successfully in Phase 1) to populate the title, hypothesis, and abstract, making the simulated output slightly more relevant.
-- Updated `\graphicspath{{./}}` in simulated LaTeX for local compilation context. Changed bib filename to `references.bib`.
-- Used `os.path.basename` for the plot path in LaTeX to avoid issues with absolute paths.
-- **TODO:** Replace simulation with actual calls to `gather_citations`, `perform_icbinb_writeup`, `compile_latex`.
+- Updated simulated LaTeX `\graphicspath` to be relative to the `latex` subdirectory where compilation happens (`../logs/0-run/experiment_results/`).
+- Changed dummy bibliography style to `plainnat` for better compatibility if `iclr2025_conference.bst` isn't copied correctly.
+- Added code to *attempt* real LaTeX compilation within the simulation block:
+    - Creates `latex` subdirectory.
+    - Copies necessary `.sty`/`.bst` files from `blank_icbinb_latex`.
+    - Writes generated LaTeX (`sim_latex`) and BibTeX (`sim_citations`) to files.
+    - **Commented out** the actual call to `compile_latex` for now to keep this phase simulated.
+    - Falls back to creating a dummy text file if real compilation is skipped or fails.
+- **TODO:** Integrate actual Reporting phase calls (`gather_citations`, `perform_icbinb_writeup`). Uncomment and test `compile_latex`.
 
 ## Next Steps:
-1.  **Test** the integrated Ideation phase thoroughly with different prompts and API keys set. Debug any issues with log capture or function calls.
-2.  Begin integration of the **Experimentation phase** (`perform_experiments_bfts`). This will require the most significant work to adapt the existing tree search code to yield incremental updates suitable for Gradio. Decide on the level of detail to yield (every node? stage summaries?). Address local code execution safety (maybe add a confirmation step or run in a restricted environment if possible).
-3.  Integrate the Reporting phase.
+1.  **Test** the integrated Experimentation phase.
+    - Requires a working local setup for the AI Scientist code execution (dependencies, potentially GPU).
+    - Set appropriate API keys for models used in `bfts_config.yaml`.
+    - Monitor the terminal output for messages from the experiment thread and the monitor thread.
+    - Check the Gradio UI for log updates and plot appearances. Debug file paths and monitoring logic. Address any thread communication issues (currently minimal).
+2.  Integrate the **Reporting phase** (`gather_citations`, `perform_icbinb_writeup`, `compile_latex`). Ensure LaTeX compilation works locally.
