@@ -486,9 +486,10 @@ def run_ai_scientist_pipeline(topic_prompt, topic_area, progress=gr.Progress()):
         # This function creates a copy in base_run_dir and modifies it
         modified_config_path = edit_bfts_config_file(
             config_path=base_config_path,
-            exp_dir=base_run_dir,  # Pass the Gradio run directory
+            # exp=base_run_dir,  # Pass the Gradio run directory
+            idea_dir=base_run_dir,  # Pass the Gradio run directory
             idea_path=final_idea_path,
-            new_config_path=run_config_path,  # Save the modified config here
+            # new_config_path=run_config_path,  # Save the modified config here
         )
         exp_log += format_log(
             f"Experiment configuration saved to {modified_config_path}"
