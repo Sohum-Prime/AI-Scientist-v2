@@ -75,7 +75,30 @@ def get_batch_responses_from_llm(
     if msg_history is None:
         msg_history = []
 
-    if "gpt" in model:
+    # Check if using OpenRouter
+    is_openrouter = False
+    if hasattr(client, 'base_url') and client.base_url and 'openrouter.ai' in client.base_url:
+        is_openrouter = True
+    
+    if is_openrouter:
+        # OpenRouter API follows OpenAI's format
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=temperature,
+            max_tokens=MAX_NUM_TOKENS,
+            n=n_responses,
+            stop=None,
+        )
+        content = [r.message.content for r in response.choices]
+        new_msg_history = [
+            new_msg_history + [{"role": "assistant", "content": c}] for c in content
+        ]
+    elif "gpt" in model:
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
         response = client.chat.completions.create(
             model=model,
@@ -157,7 +180,40 @@ def get_batch_responses_from_llm(
 
 @track_token_usage
 def make_llm_call(client, model, temperature, system_message, prompt):
-    if "gpt" in model:
+    # Check if using OpenRouter
+    is_openrouter = False
+    if hasattr(client, 'base_url') and client.base_url and 'openrouter.ai' in client.base_url:
+        is_openrouter = True
+    
+    if is_openrouter:
+        # OpenRouter API follows OpenAI's format but needs to handle different model types
+        if "anthropic" in model or "claude" in model:
+            # For Claude models via OpenRouter
+            return client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    *prompt,
+                ],
+                temperature=temperature,
+                max_tokens=MAX_NUM_TOKENS,
+                n=1,
+                stop=None,
+            )
+        else:
+            # For other models via OpenRouter
+            return client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    *prompt,
+                ],
+                temperature=temperature,
+                max_tokens=MAX_NUM_TOKENS,
+                n=1,
+                stop=None,
+            )
+    elif "gpt" in model:
         return client.chat.completions.create(
             model=model,
             messages=[
@@ -207,7 +263,24 @@ def get_response_from_llm(
     if msg_history is None:
         msg_history = []
 
-    if "claude" in model:
+    # Check if using OpenRouter
+    is_openrouter = False
+    if hasattr(client, 'base_url') and client.base_url and 'openrouter.ai' in client.base_url:
+        is_openrouter = True
+    
+    if is_openrouter:
+        # OpenRouter API follows OpenAI's format
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = make_llm_call(
+            client,
+            model,
+            temperature,
+            system_message=system_message,
+            prompt=new_msg_history,
+        )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif "claude" in model and not is_openrouter:
         new_msg_history = msg_history + [
             {
                 "role": "user",
@@ -379,6 +452,56 @@ def extract_json_between_markers(llm_output: str) -> dict | None:
 
 
 def create_client(model) -> tuple[Any, str]:
+    # Check if we should use OpenRouter for all models
+    use_openrouter = "OPENROUTER_API_KEY" in os.environ and os.environ.get("OPENROUTER_API_KEY", "")
+    
+    # Handle OpenRouter first if API key is available
+    if use_openrouter:
+        # Map model names to OpenRouter model identifiers if needed
+        openrouter_model_map = {
+            # OpenAI models
+            "gpt-4o": "openai/gpt-4o",
+            "gpt-4o-mini": "openai/gpt-4o-mini",
+            "gpt-4o-mini-2024-07-18": "openai/gpt-4o-mini-2024-07-18",
+            "gpt-4o-2024-05-13": "openai/gpt-4o-2024-05-13",
+            "gpt-4o-2024-08-06": "openai/gpt-4o-2024-08-06",
+            "gpt-4-turbo": "openai/gpt-4-turbo",
+            "gpt-4.1": "openai/gpt-4.1",
+            "gpt-4.1-2025-04-14": "openai/gpt-4.1-2025-04-14",
+            "gpt-4.1-mini": "openai/gpt-4.1-mini",
+            "gpt-4.1-mini-2025-04-14": "openai/gpt-4.1-mini-2025-04-14",
+            "o1": "openai/o1",
+            "o1-2024-12-17": "openai/o1-2024-12-17",
+            "o1-preview-2024-09-12": "openai/o1-preview-2024-09-12",
+            "o1-mini": "openai/o1-mini",
+            "o1-mini-2024-09-12": "openai/o1-mini-2024-09-12",
+            "o3-mini": "openai/o3-mini",
+            "o3-mini-2025-01-31": "openai/o3-mini-2025-01-31",
+            
+            # Anthropic models
+            "claude-3-5-sonnet-20240620": "anthropic/claude-3-5-sonnet-20240620",
+            "claude-3-5-sonnet-20241022": "anthropic/claude-3-5-sonnet-20241022",
+            
+            # Llama models
+            "llama3.1-405b": "meta-llama/llama-3.1-405b-instruct",
+            
+            # Default case - pass through the model name
+            # This allows using any model supported by OpenRouter directly
+        }
+        
+        # Get the OpenRouter model name
+        openrouter_model = openrouter_model_map.get(model, model)
+        
+        print(f"Using OpenRouter API with model {openrouter_model}")
+        return (
+            openai.OpenAI(
+                api_key=os.environ["OPENROUTER_API_KEY"],
+                base_url="https://openrouter.ai/api/v1",
+            ),
+            openrouter_model,
+        )
+    
+    # If not using OpenRouter, use the original provider APIs
     if model.startswith("claude-"):
         print(f"Using Anthropic API with model {model}.")
         return anthropic.Anthropic(), model

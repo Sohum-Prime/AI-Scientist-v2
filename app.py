@@ -31,8 +31,20 @@ if ai_scientist_path not in sys.path:
 
 # --- Import AI Scientist Modules ---
 # NOTE: We will import more specifically later as needed
-from ai_scientist.llm import create_client
+from ai_scientist.llm import create_client, AVAILABLE_LLMS
 from ai_scientist.perform_ideation_temp_free import generate_temp_free_idea
+
+# Define all possible API keys
+all_api_keys = {
+    "OPENAI_API_KEY": {"required": True, "description": "OpenAI API Key for GPT models"},
+    "S2_API_KEY": {"required": False, "description": "Semantic Scholar API Key for literature search"},
+    "AWS_ACCESS_KEY_ID": {"required": False, "description": "AWS Access Key ID for Bedrock models"},
+    "AWS_SECRET_ACCESS_KEY": {"required": False, "description": "AWS Secret Access Key for Bedrock models"},
+    "AWS_REGION_NAME": {"required": False, "description": "AWS Region for Bedrock models"},
+    "OPENROUTER_API_KEY": {"required": False, "description": "OpenRouter API Key for accessing various models"},
+    "HUGGINGFACE_API_KEY": {"required": False, "description": "HuggingFace API Key for DeepCoder models"},
+    "DEEPSEEK_API_KEY": {"required": False, "description": "DeepSeek API Key for DeepSeek Coder models"},
+}
 from ai_scientist.treesearch.perform_experiments_bfts_with_agentmanager import (
     perform_experiments_bfts,
 )
@@ -262,6 +274,97 @@ def generate_dataset_summary(dataset_info):
                     summary += f"    - ... and {len(stats['extracted_files']) - 5} more files\n"
     
     return summary
+
+
+def save_api_keys(*args):
+    """Save API keys to environment variables.
+    
+    Args:
+        *args: List of API key values in the same order as all_api_keys
+        
+    Returns:
+        str: Status message
+    """
+    # Convert args to a dictionary with key names
+    key_values = {}
+    for i, (key_name, _) in enumerate(all_api_keys.items()):
+        if i < len(args) and args[i]:
+            key_values[key_name] = args[i]
+    
+    # Set environment variables
+    for key_name, key_value in key_values.items():
+        if key_value:
+            os.environ[key_name] = key_value
+    
+    # Verify keys were set
+    missing_required = []
+    for key_name, key_info in all_api_keys.items():
+        if key_info["required"] and (key_name not in os.environ or not os.environ[key_name]):
+            missing_required.append(key_name)
+    
+    if missing_required:
+        return f"WARNING: Required API keys still missing: {', '.join(missing_required)}"
+    else:
+        return "API keys saved successfully!"
+
+
+def save_bfts_config(
+    num_workers, max_steps, num_seeds, max_debug_depth, debug_prob, num_drafts,
+    model_code, model_feedback, model_writeup, model_citation, model_review, model_agg_plots,
+    num_cite_rounds
+):
+    """Save BFTS configuration to the config file.
+    
+    Args:
+        num_workers: Number of workers (parallel paths)
+        max_steps: Maximum steps (nodes to explore)
+        num_seeds: Number of seeds
+        max_debug_depth: Maximum debug depth
+        debug_prob: Debug probability
+        num_drafts: Number of initial drafts
+        model_code: Code generation model
+        model_feedback: Feedback model
+        model_writeup: Writeup model
+        model_citation: Citation model
+        model_review: Review model
+        model_agg_plots: Plot aggregation model
+        num_cite_rounds: Number of citation rounds
+        
+    Returns:
+        str: Status message
+    """
+    try:
+        # Load the current config
+        with open("bfts_config.yaml", "r") as f:
+            config = yaml.safe_load(f)
+        
+        # Update the config with new values
+        config["agent"]["num_workers"] = num_workers
+        config["agent"]["steps"] = max_steps
+        config["agent"]["multi_seed_eval"]["num_seeds"] = num_seeds
+        config["agent"]["search"]["max_debug_depth"] = max_debug_depth
+        config["agent"]["search"]["debug_prob"] = debug_prob
+        config["agent"]["search"]["num_drafts"] = num_drafts
+        
+        # Update model configurations
+        config["agent"]["code"]["model"] = model_code
+        config["agent"]["feedback"]["model"] = model_feedback
+        config["agent"]["vlm_feedback"]["model"] = model_feedback
+        
+        # Save the updated config
+        with open("bfts_config.yaml", "w") as f:
+            yaml.dump(config, f, default_flow_style=False)
+        
+        # Store the other model configurations in environment variables for use in the pipeline
+        os.environ["MODEL_WRITEUP"] = model_writeup
+        os.environ["MODEL_CITATION"] = model_citation
+        os.environ["MODEL_REVIEW"] = model_review
+        os.environ["MODEL_AGG_PLOTS"] = model_agg_plots
+        os.environ["NUM_CITE_ROUNDS"] = str(num_cite_rounds)
+        
+        return "Configuration saved successfully!"
+    except Exception as e:
+        return f"Error saving configuration: {str(e)}"
 
 
 # --- Function to parse captured stdout for specific logs ---
@@ -622,7 +725,13 @@ def run_ai_scientist_pipeline(
     model_selection="gpt-4o-mini-2024-07-18",
     max_generations=1,
     num_reflections=2,
-    progress=gr.Progress()
+    progress=gr.Progress(),
+    # Additional model parameters from configuration
+    model_writeup="o1-preview-2024-09-12",
+    model_citation="gpt-4o-2024-11-20",
+    model_review="gpt-4o-2024-11-20",
+    model_agg_plots="o3-mini-2025-01-31",
+    num_cite_rounds=20
 ):
     """
     Main generator function to run the AI Scientist pipeline and yield updates.
@@ -640,6 +749,11 @@ def run_ai_scientist_pipeline(
         max_generations: Maximum number of ideas to generate
         num_reflections: Number of reflections to perform
         progress: Gradio progress tracker
+        model_writeup: Model to use for paper writeup
+        model_citation: Model to use for citation gathering
+        model_review: Model to use for paper review
+        model_agg_plots: Model to use for plot aggregation
+        num_cite_rounds: Number of citation rounds to perform
     """
     # Create a unique run ID and directory
     run_id = f"{get_timestamp()}_{topic_prompt[:20].replace(' ','_')}"
@@ -1449,8 +1563,134 @@ with gr.Blocks(
     )
 
     with gr.Tabs() as tabs:
+        # Tab for API Key Configuration
+        with gr.TabItem("API Keys & Configuration", id=0):
+            with gr.Column():
+                gr.Markdown("## API Key Configuration")
+                gr.Markdown("Configure API keys for different model providers. Keys are stored in memory for the current session only.")
+                
+                # Create text fields for each API key
+                api_key_inputs = {}
+                for key_name, key_info in all_api_keys.items():
+                    with gr.Row():
+                        api_key_inputs[key_name] = gr.Textbox(
+                            label=f"{key_info['description']} ({key_name})",
+                            placeholder=f"Enter your {key_name}",
+                            type="password",
+                            value=os.environ.get(key_name, ""),
+                            show_label=True
+                        )
+                
+                # Add a save button
+                save_keys_btn = gr.Button("Save API Keys", variant="primary")
+                api_keys_status = gr.Markdown("API keys will be saved in memory for the current session.")
+                
+                # Add BFTS configuration section
+                gr.Markdown("## Tree Search Configuration")
+                gr.Markdown("Configure the Best-First Tree Search parameters for experimentation.")
+                
+                with gr.Row():
+                    with gr.Column():
+                        num_workers = gr.Slider(
+                            label="Number of Workers (Parallel Paths)",
+                            minimum=1,
+                            maximum=8,
+                            value=3,
+                            step=1
+                        )
+                        max_steps = gr.Slider(
+                            label="Maximum Steps (Nodes to Explore)",
+                            minimum=5,
+                            maximum=50,
+                            value=21,
+                            step=1
+                        )
+                        num_seeds = gr.Slider(
+                            label="Number of Seeds",
+                            minimum=1,
+                            maximum=5,
+                            value=3,
+                            step=1
+                        )
+                    
+                    with gr.Column():
+                        max_debug_depth = gr.Slider(
+                            label="Maximum Debug Depth",
+                            minimum=1,
+                            maximum=5,
+                            value=3,
+                            step=1
+                        )
+                        debug_prob = gr.Slider(
+                            label="Debug Probability",
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=0.5,
+                            step=0.1
+                        )
+                        num_drafts = gr.Slider(
+                            label="Number of Initial Drafts",
+                            minimum=1,
+                            maximum=5,
+                            value=3,
+                            step=1
+                        )
+                
+                # Add model configuration section
+                gr.Markdown("## Model Configuration")
+                gr.Markdown("Configure the models used for different stages of the process.")
+                
+                with gr.Row():
+                    with gr.Column():
+                        model_code = gr.Dropdown(
+                            label="Code Generation Model",
+                            choices=AVAILABLE_LLMS,
+                            value="claude-3-5-sonnet-20241022-v2:0"
+                        )
+                        model_feedback = gr.Dropdown(
+                            label="Feedback Model",
+                            choices=AVAILABLE_LLMS,
+                            value="gpt-4o-2024-11-20"
+                        )
+                    
+                    with gr.Column():
+                        model_writeup = gr.Dropdown(
+                            label="Writeup Model",
+                            choices=AVAILABLE_LLMS,
+                            value="o1-preview-2024-09-12"
+                        )
+                        model_citation = gr.Dropdown(
+                            label="Citation Model",
+                            choices=AVAILABLE_LLMS,
+                            value="gpt-4o-2024-11-20"
+                        )
+                        model_review = gr.Dropdown(
+                            label="Review Model",
+                            choices=AVAILABLE_LLMS,
+                            value="gpt-4o-2024-11-20"
+                        )
+                        model_agg_plots = gr.Dropdown(
+                            label="Plot Aggregation Model",
+                            choices=AVAILABLE_LLMS,
+                            value="o3-mini-2025-01-31"
+                        )
+                
+                # Add citation configuration
+                with gr.Row():
+                    num_cite_rounds = gr.Slider(
+                        label="Number of Citation Rounds",
+                        minimum=5,
+                        maximum=50,
+                        value=20,
+                        step=5
+                    )
+                
+                # Add a save button for configuration
+                save_config_btn = gr.Button("Save Configuration", variant="primary")
+                config_status = gr.Markdown("Configuration will be saved for the current session.")
+            
         # --- Tab 1: Input & Setup ---
-        with gr.TabItem("Input & Setup", id=0):
+        with gr.TabItem("Input & Setup", id=1):
             with gr.Row():
                 with gr.Column(scale=3):
                     topic_textbox = gr.Textbox(
@@ -1619,7 +1859,7 @@ with gr.Blocks(
             )
 
         # --- Tab 2: Hypothesis Generation ---
-        with gr.TabItem("1. Hypothesis Generation", id=1):
+        with gr.TabItem("1. Hypothesis Generation", id=2):
             gr.Markdown("## Phase 1: Hypothesis Generation")
             
             with gr.Row():
@@ -1643,7 +1883,7 @@ with gr.Blocks(
                 ideation_final_json = gr.JSON(label="Final Generated Idea")
 
         # --- Tab 3: Experimentation ---
-        with gr.TabItem("2. Experimentation", id=2):
+        with gr.TabItem("2. Experimentation", id=3):
             gr.Markdown("## Phase 2: Experimentation (Agentic Tree Search)")
             
             with gr.Row():
@@ -1714,7 +1954,7 @@ with gr.Blocks(
                         )
 
         # --- Tab 4: Reporting ---
-        with gr.TabItem("3. Reporting", id=3):
+        with gr.TabItem("3. Reporting", id=4):
             gr.Markdown("## Phase 3: Reporting")
             
             with gr.Row():
@@ -1836,7 +2076,38 @@ with gr.Blocks(
                 outputs=[report_export_file]
             )
 
-    # --- Button Click Action ---
+    # --- Button Click Actions ---
+    # API Keys & Configuration Tab
+    # Create a list of inputs for the save_api_keys function
+    api_key_input_list = list(api_key_inputs.values())
+    
+    save_keys_btn.click(
+        fn=save_api_keys,
+        inputs=api_key_input_list,
+        outputs=[api_keys_status]
+    )
+    
+    save_config_btn.click(
+        fn=save_bfts_config,
+        inputs=[
+            num_workers,
+            max_steps,
+            num_seeds,
+            max_debug_depth,
+            debug_prob,
+            num_drafts,
+            model_code,
+            model_feedback,
+            model_writeup,
+            model_citation,
+            model_review,
+            model_agg_plots,
+            num_cite_rounds
+        ],
+        outputs=[config_status]
+    )
+    
+    # Main Pipeline
     start_button.click(
         fn=run_ai_scientist_pipeline,
         inputs=[
@@ -1854,7 +2125,13 @@ with gr.Blocks(
             # Advanced options
             model_selection,
             max_generations,
-            num_reflections
+            num_reflections,
+            # Model configuration from the API Keys & Configuration tab
+            model_writeup,
+            model_citation,
+            model_review,
+            model_agg_plots,
+            num_cite_rounds
         ],
         outputs=[
             # Define outputs for all components that can be updated by the generator
@@ -1896,23 +2173,23 @@ with gr.Blocks(
 if __name__ == "__main__":
     # Load API keys from environment variables
     print("Checking for API keys...")
-    # Add any other keys your chosen ideation model might need (e.g., Anthropic, Bedrock)
-    required_keys = ["OPENAI_API_KEY"]
-    # Optional key for literature search
-    optional_keys = ["S2_API_KEY"]
-
+    
+    # Check which keys are missing
+    required_keys = [k for k, v in all_api_keys.items() if v["required"]]
+    optional_keys = [k for k, v in all_api_keys.items() if not v["required"]]
+    
     missing_keys = [key for key in required_keys if key not in os.environ]
     if missing_keys:
         print(
             f"\n!!! WARNING: Missing required environment variables: {', '.join(missing_keys)} !!!"
         )
         print("Ideation might fail. Please set them before running the application.")
-        # sys.exit(1) # Exit if keys are essential
+        # We'll allow the app to start and configure keys through the UI
 
     missing_optional = [key for key in optional_keys if key not in os.environ]
     if missing_optional:
         print(
-            f"\nINFO: Missing optional environment variables: {', '.join(missing_optional)}. Semantic Scholar search might be limited."
+            f"\nINFO: Missing optional environment variables: {', '.join(missing_optional)}. Some features might be limited."
         )
 
     print("Launching Gradio Demo...")
