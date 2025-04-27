@@ -64,6 +64,10 @@ pip install -r requirements.txt
 
 By default, the system uses the `OPENAI_API_KEY` environment variable for OpenAI models.
 
+#### Gemini Models
+
+By default, the system uses the `GEMINI_API_KEY` environment variable for Gemini models through OpenAI API.
+
 #### Claude Models via AWS Bedrock
 
 To use Claude models provided by Amazon Bedrock, install the necessary additional packages:
